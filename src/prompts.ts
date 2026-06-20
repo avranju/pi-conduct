@@ -127,6 +127,7 @@ export function buildReviewerPrompt(
   gitDiff: string,
   checkOutputs: CheckResult[],
   reviewHistory: ReviewResult[],
+  notes?: string,
 ): string {
   const checkOutputText = formatCheckOutputs(checkOutputs);
   const reviewHistoryText =
@@ -179,6 +180,8 @@ export function buildReviewerPrompt(
     reviewHistoryText,
     `---`,
     ``,
+    notes ? `Supervisor notes:\n---\n${notes}\n---\n` : "",
+    ``,
     `Return a strict JSON ReviewResult object.`,
     ``,
     `Rules:`,
@@ -198,19 +201,25 @@ export function buildReviewerPrompt(
 // Repair Prompts (for retrying malformed JSON)
 // ============================================================================
 
-export function buildPlannerRepairPrompt(): string {
+export function buildPlannerRepairPrompt(errors?: string[]): string {
+  const errorList = errors && errors.length > 0
+    ? `\nValidation errors:\n${errors.map((e) => `- ${e}`).join("\n")}\n`
+    : "";
   return [
-    `Your previous response did not contain valid JSON matching the required ImplementationPlan schema.`,
-    `Return only corrected JSON in a markdown code block with the language "json".`,
-    `Ensure all required fields are present and types are correct.`,
+    `Your previous response did not contain valid JSON matching the required ImplementationPlan schema.${errorList}`,
+    `Return only the corrected JSON in a markdown code block with the language "json".`,
+    `Ensure all required fields are present, arrays are arrays, and enum values match the schema exactly.`,
   ].join("\n");
 }
 
-export function buildReviewerRepairPrompt(): string {
+export function buildReviewerRepairPrompt(errors?: string[]): string {
+  const errorList = errors && errors.length > 0
+    ? `\nValidation errors:\n${errors.map((e) => `- ${e}`).join("\n")}\n`
+    : "";
   return [
-    `Your previous response did not contain valid JSON matching the required ReviewResult schema.`,
-    `Return only corrected JSON in a markdown code block with the language "json".`,
-    `Ensure all required fields are present and types are correct.`,
+    `Your previous response did not contain valid JSON matching the required ReviewResult schema.${errorList}`,
+    `Return only the corrected JSON in a markdown code block with the language "json".`,
+    `Ensure status is one of "approved", "needs_changes", "blocked" and all required fields are present.`,
   ].join("\n");
 }
 

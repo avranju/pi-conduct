@@ -2,14 +2,19 @@ import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-c
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { loadConfig } from "./config.js";
-import { validateCleanGit } from "./git.js";
-import { createRunDirectory, saveUserPrompt, saveConfig, saveFinalSummary } from "./artifacts.js";
+import { validateCleanGit, getGitRoot, type Exec } from "./git.js";
+import {
+  createRunDirectory,
+  saveUserPrompt,
+  saveConfig,
+  saveFinalSummary,
+} from "./artifacts.js";
 import { status, clearStatus, notify } from "./ui.js";
 import { runConductWorkflow, type WorkflowResult } from "./supervisor.js";
 import { generateRunId, slugify } from "./utils.js";
 
 // ============================================================================
-// Pi Conduct Extension - Entry Point
+// Pi Conduct Extension - Entry Point (§3)
 // ============================================================================
 
 export default function conductExtension(pi: ExtensionAPI) {
@@ -18,7 +23,7 @@ export default function conductExtension(pi: ExtensionAPI) {
     handler: async (args: string, ctx: ExtensionCommandContext) => {
       const userPrompt = args.trim();
 
-      // Validate input
+      // §3: validate input
       if (!userPrompt) {
         ctx.ui.notify("Usage: /conduct <task prompt>", "error");
         return;
@@ -29,58 +34,89 @@ export default function conductExtension(pi: ExtensionAPI) {
         return;
       }
 
-      // Check git repo
-      const gitRoot = await getGitRoot(ctx.cwd, ctx.exec.bind(ctx));
+      const exec: Exec = pi.exec.bind(pi);
+
+      // Must be a git repo (§8)
+      const gitRoot = await getGitRoot(exec);
       if (!gitRoot) {
         ctx.ui.notify("Conduct requires a git repository", "error");
         return;
       }
 
-      // --- Load Config ---
+      // --- Load Config (§4) ---
       const { config, warnings, configPath } = loadConfig(ctx.cwd);
-
-      // Show config warnings
       for (const warning of warnings) {
         ctx.ui.notify(warning, "warning");
       }
+      if (!configPath) {
+        ctx.ui.notify("Using safe default config (no config file found)", "info");
+      }
 
-      // --- Validate Clean Git ---
+      // --- Validate Clean Git (§8) ---
       if (config.loop.requireCleanGit) {
-        const { clean, status: gitStatus } = await validateCleanGit(ctx.cwd, ctx.exec.bind(ctx));
+        const { clean, status: gitStatus } = await validateCleanGit(exec);
         if (!clean) {
           const msg = [
             "Working tree is not clean. Aborting.",
             "Git status:",
             gitStatus.slice(0, 500),
             "",
-            "Use --allow-dirty to proceed (not yet implemented).",
+            "Future: use /conduct --allow-dirty <prompt> (not yet implemented).",
           ].join("\n");
           ctx.ui.notify(msg, "error");
           return;
         }
       }
 
-      // --- Create Run Directory ---
+      // --- Create Run Directory (§7) ---
       const slug = slugify(userPrompt, 3);
       const runId = generateRunId(slug);
       const artifactRoot = path.join(ctx.cwd, config.artifacts.root);
       const { dir: runDir, root: runRoot } = createRunDirectory(artifactRoot, runId);
 
-      // Save initial artifacts
       saveUserPrompt(runDir, userPrompt);
       saveConfig(runDir, config);
 
       // --- Gather Repository Context ---
-      const repoContext = await gatherRepoContext(ctx.cwd, ctx.exec.bind(ctx));
+      const repoContext = await gatherRepoContext(ctx.cwd, exec);
+
+      // --- Workflow abort signal ---
+      // ctx.signal is typically undefined in command handlers (the host agent is
+      // idle), so create an internal controller and forward the host signal if
+      // present.
+      const controller = new AbortController();
+      if (ctx.signal) {
+        if (ctx.signal.aborted) controller.abort();
+        else ctx.signal.addEventListener("abort", () => controller.abort(), { once: true });
+      }
+      const signal = controller.signal;
 
       // --- Run Workflow ---
-      const result = await runConductWorkflow(userPrompt, config, ctx, repoContext, runDir);
+      let result: WorkflowResult;
+      try {
+        result = await runConductWorkflow(
+          userPrompt,
+          config,
+          ctx,
+          exec,
+          repoContext,
+          runDir,
+          signal,
+        );
+      } catch (err: unknown) {
+        const message = err instanceof Error ? err.message : String(err);
+        const summary = `Conduct failed with an unexpected error: ${message}`;
+        saveFinalSummary(runDir, summary);
+        ctx.ui.notify(summary, "error");
+        await clearStatus(ctx);
+        return;
+      }
 
       // --- Save Final Summary ---
       saveFinalSummary(runDir, result.summary);
 
-      // --- Print Final Summary ---
-      await printFinalSummary(result, ctx, runRoot);
+      // --- Print Final Summary (§17) ---
+      await printFinalSummary(result, ctx);
 
       // --- Cleanup ---
       await clearStatus(ctx);
@@ -92,25 +128,12 @@ export default function conductExtension(pi: ExtensionAPI) {
 // Helpers
 // ============================================================================
 
-async function getGitRoot(cwd: string, execFn: (cmd: string, args: string[], opts?: { timeout?: number }) => Promise<{ code: number; stdout: string; stderr: string }>): Promise<string | null> {
-  try {
-    const result = await execFn("git", ["rev-parse", "--show-toplevel"], { timeout: 5000 });
-    if (result.code === 0) return result.stdout.trim();
-    return null;
-  } catch {
-    return null;
-  }
-}
-
-async function gatherRepoContext(
-  cwd: string,
-  execFn: (cmd: string, args: string[], opts?: { timeout?: number }) => Promise<{ code: number; stdout: string; stderr: string }>,
-): Promise<string> {
+async function gatherRepoContext(cwd: string, exec: Exec): Promise<string> {
   const parts: string[] = [];
 
-  // Get git remote info
+  // Git remote info
   try {
-    const remote = await execFn("git", ["remote", "-v"], { timeout: 5000 });
+    const remote = await exec("git", ["remote", "-v"], { timeout: 5_000 });
     if (remote.code === 0 && remote.stdout.trim()) {
       parts.push(`## Git Remote\n${remote.stdout.trim().slice(0, 500)}`);
     }
@@ -118,9 +141,9 @@ async function gatherRepoContext(
     // Ignore
   }
 
-  // Get file structure (top-level only)
+  // Top-level file structure
   try {
-    const lsResult = await execFn("ls", ["-la", cwd], { timeout: 5000 });
+    const lsResult = await exec("ls", ["-la", cwd], { timeout: 5_000 });
     if (lsResult.code === 0) {
       parts.push(`## Top-level Files\n\`\`\`\n${lsResult.stdout.trim().slice(0, 1000)}\n\`\`\``);
     }
@@ -128,8 +151,7 @@ async function gatherRepoContext(
     // Ignore
   }
 
-  // Check for common project files
-  const projectIndicators: string[] = [];
+  // Common project files
   const checkFiles = [
     "package.json",
     "Cargo.toml",
@@ -141,14 +163,12 @@ async function gatherRepoContext(
     "README.md",
     "tsconfig.json",
   ];
-
+  const projectIndicators: string[] = [];
   for (const file of checkFiles) {
-    const filePath = path.join(cwd, file);
-    if (fs.existsSync(filePath)) {
+    if (fs.existsSync(path.join(cwd, file))) {
       projectIndicators.push(file);
     }
   }
-
   if (projectIndicators.length > 0) {
     parts.push(`## Project Indicators: ${projectIndicators.join(", ")}`);
   }
@@ -159,7 +179,6 @@ async function gatherRepoContext(
 async function printFinalSummary(
   result: WorkflowResult,
   ctx: ExtensionCommandContext,
-  artifactPath: string,
 ): Promise<void> {
   const lines: string[] = [];
 
@@ -172,7 +191,9 @@ async function printFinalSummary(
   lines.push("");
   lines.push(`Reason: ${result.reason}`);
   lines.push(`Iterations: ${result.iterations}`);
-  lines.push(`Modified files: ${result.modifiedFiles.length > 0 ? result.modifiedFiles.join(", ") : "none"}`);
+  lines.push(
+    `Modified files: ${result.modifiedFiles.length > 0 ? result.modifiedFiles.join(", ") : "none"}`,
+  );
   lines.push("");
 
   if (result.lastChecks && result.lastChecks.length > 0) {
@@ -190,8 +211,7 @@ async function printFinalSummary(
   }
 
   lines.push("");
-  lines.push(`Artifacts: ${artifactPath}`);
+  lines.push(`Artifacts: ${result.artifactPath}`);
 
-  const summary = lines.join("\n");
-  ctx.ui.notify(summary, result.success ? "info" : "warning");
+  ctx.ui.notify(lines.join("\n"), result.success ? "info" : "warning");
 }

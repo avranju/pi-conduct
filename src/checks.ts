@@ -1,9 +1,10 @@
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExecOptions, ExecResult } from "@earendil-works/pi-coding-agent";
 import type { CheckResult } from "./schemas.js";
 import { truncate } from "./utils.js";
+import type { Exec } from "./git.js";
 
 // ============================================================================
-// Check Execution
+// Check Execution (§9)
 // ============================================================================
 
 export interface CheckGroup {
@@ -13,7 +14,7 @@ export interface CheckGroup {
 
 export async function runCheckCommand(
   command: string,
-  exec: ExtensionAPI["exec"],
+  exec: Exec,
   timeoutMs: number = 120_000,
 ): Promise<CheckResult> {
   const start = Date.now();
@@ -21,17 +22,18 @@ export async function runCheckCommand(
     const result = await exec("sh", ["-c", command], { timeout: timeoutMs });
     return {
       command,
-      exitCode: result.code ?? -1,
+      exitCode: result.code,
       stdout: result.stdout,
       stderr: result.stderr,
       durationMs: Date.now() - start,
     };
-  } catch (err: any) {
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : "Command execution failed";
     return {
       command,
       exitCode: -1,
       stdout: "",
-      stderr: err.message || "Command execution failed",
+      stderr: message,
       durationMs: Date.now() - start,
     };
   }
@@ -39,35 +41,22 @@ export async function runCheckCommand(
 
 export async function runConfiguredChecks(
   commands: { format: string[]; lint: string[]; test: string[] },
-  exec: ExtensionAPI["exec"],
+  exec: Exec,
 ): Promise<CheckGroup[]> {
   const groups: CheckGroup[] = [];
 
-  // Run format checks
-  if (commands.format.length > 0) {
+  // §9: format -> lint -> test
+  for (const [groupName, cmds] of [
+    ["format", commands.format],
+    ["lint", commands.lint],
+    ["test", commands.test],
+  ] as const) {
+    if (cmds.length === 0) continue;
     const results: CheckResult[] = [];
-    for (const cmd of commands.format) {
+    for (const cmd of cmds) {
       results.push(await runCheckCommand(cmd, exec));
     }
-    groups.push({ groupName: "format", results });
-  }
-
-  // Run lint checks
-  if (commands.lint.length > 0) {
-    const results: CheckResult[] = [];
-    for (const cmd of commands.lint) {
-      results.push(await runCheckCommand(cmd, exec));
-    }
-    groups.push({ groupName: "lint", results });
-  }
-
-  // Run test checks
-  if (commands.test.length > 0) {
-    const results: CheckResult[] = [];
-    for (const cmd of commands.test) {
-      results.push(await runCheckCommand(cmd, exec));
-    }
-    groups.push({ groupName: "test", results });
+    groups.push({ groupName, results });
   }
 
   return groups;
@@ -112,7 +101,7 @@ export function summarizeCheckGroups(groups: CheckGroup[]): string {
     for (const result of group.results) {
       const cmdStatus = result.exitCode === 0 ? "PASS" : "FAIL";
       const summary = truncate(result.stdout || result.stderr, 1000);
-      parts.push(`  [${cmdStatus}] ${result.command}`);
+      parts.push(`  [${cmdStatus}] ${result.command} (exit ${result.exitCode}, ${result.durationMs}ms)`);
       if (summary) {
         parts.push(`    ${summary}`);
       }

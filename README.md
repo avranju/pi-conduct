@@ -97,6 +97,10 @@ Create a config file at one of these locations (first match wins):
     "continueAfterCheckFailure": true,
     "minorFindingIterationCutoff": 3
   },
+  "safety": {
+    "allowNetwork": false,
+    "blockedCommandPatterns": []
+  },
   "commands": {
     "format": ["cargo fmt --check"],
     "lint": ["cargo clippy --all-targets -- -D warnings"],
@@ -128,6 +132,9 @@ Create a config file at one of these locations (first match wins):
 | `loop.requireApproval` | Require reviewer approval | `true` |
 | `loop.requirePassingChecks` | Require all configured checks to pass | `true` |
 | `loop.continueAfterCheckFailure` | Continue to reviewer even if checks fail | `true` |
+| `loop.minorFindingIterationCutoff` | Stop when only minor findings remain past this iteration | `3` |
+| `safety.allowNetwork` | Allow network/package-install commands in agent bash | `false` |
+| `safety.blockedCommandPatterns` | Extra regex patterns to block in agent bash | `[]` |
 | `commands.format` | Format check commands | `[]` |
 | `commands.lint` | Lint check commands | `[]` |
 | `commands.test` | Test check commands | `[]` |
@@ -139,19 +146,31 @@ Create a config file at one of these locations (first match wins):
 src/
   index.ts        - Entry point, registers /conduct command
   config.ts       - Config loading and validation
-  supervisor.ts   - Main workflow orchestrator
-  agents.ts       - Planner, Coder, and Reviewer agent communication
+  supervisor.ts   - Main workflow orchestrator (state machine + loop)
+  agents.ts       - Planner, Coder, and Reviewer AgentSession management
   prompts.ts      - Prompt templates for each agent role
-  schemas.ts      - TypeScript type definitions
+  schemas.ts      - TypeScript type definitions and config defaults
+  validation.ts   - Strict schema validation for agent JSON outputs
+  safe-bash.ts    - Guarded "bash" tool that enforces the safety policy
   git.ts          - Git utility functions
   checks.ts       - Check execution (format, lint, test)
-  artifacts.ts    - Artifact storage and management
+  artifacts.ts    - Artifact storage and run-state persistence
   ui.ts           - Progress UI helpers
-  utils.ts        - Utility functions
+  utils.ts        - Utility functions (JSON extraction, safety patterns)
 ```
 
 The package is declared via the `pi` manifest in `package.json`
 (`pi.extensions: ["./src/index.ts"]`).
+
+Each role runs in its **own isolated Pi SDK `AgentSession`** with a
+role-specific tool set: the planner inspects the repo (`read`/`grep`/`find`/
+`ls`/`bash`), the coder edits files (`read`/`edit`/`write`/`bash`/`grep`/
+`find`/`ls`), and the reviewer is structurally read-only
+(`read`/`grep`/`find`/`ls`/`bash` — no `edit`/`write`). Sub-sessions load no
+host extensions/skills/prompts (so they cannot recurse into `/conduct`) but do
+load project context files (`AGENTS.md`). Every agent handoff returns strict
+JSON that is validated against the schemas in `src/validation.ts` before the
+supervisor proceeds.
 
 ## Artifact Storage
 
@@ -161,33 +180,52 @@ Every `/conduct` run gets a unique run directory:
 .pi/conduct/runs/<timestamp>-<slug>/
   user-prompt.md
   config.resolved.json
+  state.json
+  planner-prompt.md
+  planner-transcript.json
   plan.raw.md
   plan.json
   plan.validation.json
   iterations/
     1/
+      coder-prompt.md
       coder-response.md
       coder-compliance.json
+      coder-transcript.json
       git-diff.patch
       git-diff-stat.txt
       checks/
         format-*.txt
         lint-*.txt
         test-*.txt
+      review-prompt.md
       review-response.md
       review.json
+      reviewer-transcript.json
     2/
       ...
   final-summary.md
 ```
 
+`state.json` persists the workflow state machine (§6) at every stage
+transition so a run can be inspected without trusting model prose.
+
 ## Safety Policy
 
-- Blocks dangerous shell commands (`rm -rf /`, `chmod 777`, etc.)
-- Requires clean git working tree (configurable)
-- No auto-commits
-- No package installations (unless explicitly allowed)
-- All changes visible via git diff
+- **Clean git tree required** by default before a run starts (§8).
+- **Dangerous shell commands are always blocked** in agent `bash` calls
+  (`rm -rf /`, `rm -rf ~`, `chmod -R 777`, `curl|sh`, `sudo`, fork bombs,
+  `dd of=/dev/`, `mkfs`, …). Implemented as a guarded `bash` tool
+  (`src/safe-bash.ts`) that overrides the built-in for every role.
+- **Network / package installs blocked** when `safety.allowNetwork` is `false`
+  (default): `curl`, `wget`, `npm/pnpm/yarn/cargo/pip/uv/go/brew/apt/dnf/
+  pacman/gem/composer install`, `git clone`.
+- Additional block patterns can be added via `safety.blockedCommandPatterns`
+  (regex strings).
+- **No auto-commits** — all changes are visible via `git diff`.
+
+This is a guardrail, not a sandbox (§15). Real isolation should later use
+containers.
 
 ## State Machine
 

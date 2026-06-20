@@ -107,10 +107,12 @@ export interface CheckGroup {
 
 // --- Model Role Config ---
 
+export type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
+
 export interface ModelConfig {
   provider: string;
   model: string;
-  thinkingLevel: "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
+  thinkingLevel: ThinkingLevel;
 }
 
 // --- Loop Config ---
@@ -122,6 +124,22 @@ export interface LoopConfig {
   requirePassingChecks: boolean;
   continueAfterCheckFailure: boolean;
   minorFindingIterationCutoff: number;
+}
+
+// --- Safety Config ---
+
+export interface SafetyConfig {
+  /**
+   * When false, block obvious network and package-install commands issued by
+   * agent bash tools (curl, wget, npm/pnpm/cargo/pip/go install, etc.).
+   * Default: false.
+   */
+  allowNetwork: boolean;
+  /**
+   * Additional regex patterns to block in agent bash commands, on top of the
+   * built-in dangerous-command patterns.
+   */
+  blockedCommandPatterns: string[];
 }
 
 // --- Artifact Config ---
@@ -141,6 +159,7 @@ export interface ConductConfig {
     reviewer: ModelConfig;
   };
   loop: LoopConfig;
+  safety: SafetyConfig;
   commands: {
     format: string[];
     lint: string[];
@@ -177,6 +196,10 @@ export const DEFAULT_CONFIG: ConductConfig = {
     continueAfterCheckFailure: true,
     minorFindingIterationCutoff: 3,
   },
+  safety: {
+    allowNetwork: false,
+    blockedCommandPatterns: [],
+  },
   commands: {
     format: [],
     lint: [],
@@ -189,28 +212,24 @@ export const DEFAULT_CONFIG: ConductConfig = {
   },
 };
 
-// --- Run State ---
+// --- Run State Machine (§6) ---
 
-export interface CheckOutputSummary {
-  format: { passed: boolean; summary: string; fullPath: string };
-  lint: { passed: boolean; summary: string; fullPath: string };
-  test: { passed: boolean; summary: string; fullPath: string };
-}
+export type RunStage =
+  | "idle"
+  | "initializing"
+  | "validatingWorkspace"
+  | "planning"
+  | "validatingPlan"
+  | "implementing"
+  | "runningChecks"
+  | "reviewing"
+  | "fixing"
+  | "completed"
+  | "failed"
+  | "needsUserIntervention";
 
 export interface RunState {
-  stage:
-    | "idle"
-    | "initializing"
-    | "validatingWorkspace"
-    | "planning"
-    | "validatingPlan"
-    | "implementing"
-    | "runningChecks"
-    | "reviewing"
-    | "fixing"
-    | "completed"
-    | "failed"
-    | "needsUserIntervention";
+  stage: RunStage;
   iteration: number;
   maxIterations: number;
   planValid: boolean;
@@ -218,4 +237,18 @@ export interface RunState {
   reviewStatus: ReviewStatus | null;
   reviewFindingCount: { blocking: number; important: number; minor: number };
   error?: string;
+  updatedAt: string;
+}
+
+export function emptyRunState(maxIterations: number): RunState {
+  return {
+    stage: "idle",
+    iteration: 0,
+    maxIterations,
+    planValid: false,
+    checksPass: false,
+    reviewStatus: null,
+    reviewFindingCount: { blocking: 0, important: 0, minor: 0 },
+    updatedAt: new Date().toISOString(),
+  };
 }

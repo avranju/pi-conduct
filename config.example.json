@@ -24,6 +24,10 @@
     "continueAfterCheckFailure": true,
     "minorFindingIterationCutoff": 3
   },
+  "safety": {
+    "allowNetwork": false,
+    "blockedCommandPatterns": []
+  },
   "commands": {
     "format": [],
     "lint": [],

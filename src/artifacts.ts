@@ -1,15 +1,24 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import type { ConductConfig, ImplementationPlan, CoderCompliance, ReviewResult, CheckGroup } from "./schemas.js";
+import type {
+  ConductConfig,
+  ImplementationPlan,
+  CoderCompliance,
+  ReviewResult,
+  CheckGroup,
+  RunState,
+} from "./schemas.js";
 
 // ============================================================================
-// Artifact Storage
+// Artifact Storage (§7)
 // ============================================================================
 
 export interface RunDirectory {
   root: string;
   userPromptPath: string;
   configPath: string;
+  statePath: string;
+  plannerPromptPath: string;
   planRawPath: string;
   planJsonPath: string;
   planValidationPath: string;
@@ -23,41 +32,55 @@ export function createRunDirectory(
 ): { dir: RunDirectory; root: string } {
   const root = path.join(artifactRoot, runId);
   fs.mkdirSync(root, { recursive: true });
-
-  // Create subdirectories
   fs.mkdirSync(path.join(root, "iterations"), { recursive: true });
-
-  const iterationPaths = new Map<number, string>();
 
   return {
     dir: {
       root,
       userPromptPath: path.join(root, "user-prompt.md"),
       configPath: path.join(root, "config.resolved.json"),
+      statePath: path.join(root, "state.json"),
+      plannerPromptPath: path.join(root, "planner-prompt.md"),
       planRawPath: path.join(root, "plan.raw.md"),
       planJsonPath: path.join(root, "plan.json"),
       planValidationPath: path.join(root, "plan.validation.json"),
-      iterationPaths,
+      iterationPaths: new Map<number, string>(),
       finalSummaryPath: path.join(root, "final-summary.md"),
     },
     root,
   };
 }
 
+function writeText(filePath: string, content: string): void {
+  fs.writeFileSync(filePath, content, "utf-8");
+}
+
+function writeJson(filePath: string, data: unknown): void {
+  fs.writeFileSync(filePath, JSON.stringify(data, null, 2), "utf-8");
+}
+
 export function saveUserPrompt(dir: RunDirectory, prompt: string): void {
-  fs.writeFileSync(dir.userPromptPath, prompt, "utf-8");
+  writeText(dir.userPromptPath, prompt);
 }
 
 export function saveConfig(dir: RunDirectory, config: ConductConfig): void {
-  fs.writeFileSync(dir.configPath, JSON.stringify(config, null, 2), "utf-8");
+  writeJson(dir.configPath, config);
+}
+
+export function saveState(dir: RunDirectory, state: RunState): void {
+  writeJson(dir.statePath, state);
+}
+
+export function savePlannerPrompt(dir: RunDirectory, prompt: string): void {
+  writeText(dir.plannerPromptPath, prompt);
 }
 
 export function savePlanRaw(dir: RunDirectory, rawText: string): void {
-  fs.writeFileSync(dir.planRawPath, rawText, "utf-8");
+  writeText(dir.planRawPath, rawText);
 }
 
 export function savePlanJson(dir: RunDirectory, plan: ImplementationPlan): void {
-  fs.writeFileSync(dir.planJsonPath, JSON.stringify(plan, null, 2), "utf-8");
+  writeJson(dir.planJsonPath, plan);
 }
 
 export function savePlanValidation(
@@ -65,17 +88,35 @@ export function savePlanValidation(
   valid: boolean,
   errors?: string[],
 ): void {
-  const validation = { valid, errors: errors || [], timestamp: new Date().toISOString() };
-  fs.writeFileSync(dir.planValidationPath, JSON.stringify(validation, null, 2), "utf-8");
+  writeJson(dir.planValidationPath, {
+    valid,
+    errors: errors || [],
+    timestamp: new Date().toISOString(),
+  });
+}
+
+export function saveTranscript(
+  dir: RunDirectory | undefined,
+  filePath: string,
+  transcript: string,
+  keep: boolean,
+): void {
+  if (!dir || !keep) return;
+  writeText(filePath, transcript);
 }
 
 export function getIterationDir(dir: RunDirectory, iteration: number): string {
-  if (!dir.iterationPaths.has(iteration)) {
-    const iterDir = path.join(dir.root, "iterations", String(iteration));
+  let iterDir = dir.iterationPaths.get(iteration);
+  if (!iterDir) {
+    iterDir = path.join(dir.root, "iterations", String(iteration));
     fs.mkdirSync(iterDir, { recursive: true });
     dir.iterationPaths.set(iteration, iterDir);
   }
-  return dir.iterationPaths.get(iteration)!;
+  return iterDir;
+}
+
+export function saveCoderPrompt(iterationDir: string, prompt: string): void {
+  writeText(path.join(iterationDir, "coder-prompt.md"), prompt);
 }
 
 export function saveCoderArtifacts(
@@ -83,12 +124,8 @@ export function saveCoderArtifacts(
   coderResponse: string,
   compliance: CoderCompliance,
 ): void {
-  fs.writeFileSync(path.join(iterationDir, "coder-response.md"), coderResponse, "utf-8");
-  fs.writeFileSync(
-    path.join(iterationDir, "coder-compliance.json"),
-    JSON.stringify(compliance, null, 2),
-    "utf-8",
-  );
+  writeText(path.join(iterationDir, "coder-response.md"), coderResponse);
+  writeJson(path.join(iterationDir, "coder-compliance.json"), compliance);
 }
 
 export function saveGitDiff(
@@ -96,8 +133,8 @@ export function saveGitDiff(
   diff: string,
   stat: string,
 ): void {
-  fs.writeFileSync(path.join(iterationDir, "git-diff.patch"), diff, "utf-8");
-  fs.writeFileSync(path.join(iterationDir, "git-diff-stat.txt"), stat, "utf-8");
+  writeText(path.join(iterationDir, "git-diff.patch"), diff);
+  writeText(path.join(iterationDir, "git-diff-stat.txt"), stat);
 }
 
 export function saveCheckResults(
@@ -122,9 +159,13 @@ export function saveCheckResults(
         `--- stderr ---`,
         result.stderr || "(empty)",
       ].join("\n");
-      fs.writeFileSync(filePath, content, "utf-8");
+      writeText(filePath, content);
     }
   }
+}
+
+export function saveReviewerPrompt(iterationDir: string, prompt: string): void {
+  writeText(path.join(iterationDir, "review-prompt.md"), prompt);
 }
 
 export function saveReviewerArtifacts(
@@ -132,20 +173,12 @@ export function saveReviewerArtifacts(
   reviewResponse: string,
   reviewResult: ReviewResult,
 ): void {
-  fs.writeFileSync(
-    path.join(iterationDir, "review-response.md"),
-    reviewResponse,
-    "utf-8",
-  );
-  fs.writeFileSync(
-    path.join(iterationDir, "review.json"),
-    JSON.stringify(reviewResult, null, 2),
-    "utf-8",
-  );
+  writeText(path.join(iterationDir, "review-response.md"), reviewResponse);
+  writeJson(path.join(iterationDir, "review.json"), reviewResult);
 }
 
 export function saveFinalSummary(dir: RunDirectory, summary: string): void {
-  fs.writeFileSync(dir.finalSummaryPath, summary, "utf-8");
+  writeText(dir.finalSummaryPath, summary);
 }
 
 export function listRunDirectories(artifactRoot: string): string[] {

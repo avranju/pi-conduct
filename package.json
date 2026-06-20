@@ -8,9 +8,13 @@
     "extensions": ["./src/index.ts"]
   },
   "scripts": {
-    "clean": "echo 'nothing to clean'",
-    "build": "echo 'nothing to build'",
-    "check": "echo 'nothing to check'"
+    "clean": "rm -rf .pi/conduct/runs",
+    "build": "tsc --noEmit",
+    "check": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "typescript": "^5",
+    "@types/node": "^22"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",
