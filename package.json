@@ -1,0 +1,19 @@
+{
+  "name": "pi-conduct",
+  "version": "0.1.0",
+  "description": "Pi extension that adds a /conduct slash command for orchestrated multi-agent coding workflows.",
+  "type": "module",
+  "keywords": ["pi-package"],
+  "pi": {
+    "extensions": ["./src/index.ts"]
+  },
+  "scripts": {
+    "clean": "echo 'nothing to clean'",
+    "build": "echo 'nothing to build'",
+    "check": "echo 'nothing to check'"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*"
+  }
+}
