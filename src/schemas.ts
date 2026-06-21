@@ -45,6 +45,107 @@ export interface ImplementationPlan {
   implementationOrder: string[];
 }
 
+/** Runtime JSON Schema supplied to the planner for its structured handoff. */
+export const IMPLEMENTATION_PLAN_JSON_SCHEMA = {
+  $schema: "https://json-schema.org/draft/2020-12/schema",
+  title: "ImplementationPlan",
+  type: "object",
+  additionalProperties: false,
+  required: [
+    "goal",
+    "assumptions",
+    "risks",
+    "filesToInspect",
+    "filesToModify",
+    "filesToCreate",
+    "typesToCreate",
+    "controlFlow",
+    "errorHandling",
+    "tests",
+    "acceptanceCriteria",
+    "implementationOrder",
+  ],
+  properties: {
+    goal: { type: "string", minLength: 1 },
+    assumptions: { type: "array", items: { type: "string" } },
+    risks: { type: "array", items: { type: "string" } },
+    filesToInspect: { type: "array", items: { type: "string" } },
+    filesToModify: {
+      type: "array",
+      items: {
+        type: "object",
+        additionalProperties: false,
+        required: ["path", "reason", "plannedChanges"],
+        properties: {
+          path: { type: "string" },
+          reason: { type: "string" },
+          plannedChanges: { type: "array", items: { type: "string" } },
+        },
+      },
+    },
+    filesToCreate: {
+      type: "array",
+      items: {
+        type: "object",
+        additionalProperties: false,
+        required: ["path", "reason", "plannedContentsSummary"],
+        properties: {
+          path: { type: "string" },
+          reason: { type: "string" },
+          plannedContentsSummary: { type: "string" },
+        },
+      },
+    },
+    typesToCreate: {
+      type: "array",
+      items: {
+        type: "object",
+        additionalProperties: false,
+        required: ["name", "kind", "location", "purpose"],
+        properties: {
+          name: { type: "string" },
+          kind: {
+            type: "string",
+            enum: [
+              "struct",
+              "enum",
+              "type",
+              "interface",
+              "trait",
+              "class",
+              "function",
+              "other",
+            ],
+          },
+          location: { type: "string" },
+          purpose: { type: "string" },
+          fieldsOrSignature: { type: "string" },
+        },
+      },
+    },
+    controlFlow: { type: "array", items: { type: "string" } },
+    errorHandling: { type: "array", items: { type: "string" } },
+    tests: {
+      type: "array",
+      items: {
+        type: "object",
+        additionalProperties: false,
+        required: ["kind", "description"],
+        properties: {
+          path: { type: "string" },
+          kind: {
+            type: "string",
+            enum: ["unit", "integration", "snapshot", "manual", "other"],
+          },
+          description: { type: "string" },
+        },
+      },
+    },
+    acceptanceCriteria: { type: "array", items: { type: "string" } },
+    implementationOrder: { type: "array", items: { type: "string" } },
+  },
+} as const;
+
 // --- Coder Compliance Report ---
 
 export interface CoderCompliance {
@@ -66,6 +167,69 @@ export interface CoderCompliance {
   }>;
   knownIssues: string[];
 }
+
+/** Runtime JSON Schema supplied to the coder for its structured handoff. */
+export const CODER_COMPLIANCE_JSON_SCHEMA = {
+  $schema: "https://json-schema.org/draft/2020-12/schema",
+  title: "CoderCompliance",
+  type: "object",
+  additionalProperties: false,
+  required: [
+    "summary",
+    "filesChanged",
+    "planItemsCompleted",
+    "planItemsSkipped",
+    "reviewerItemsAddressed",
+    "commandsRun",
+    "knownIssues",
+  ],
+  properties: {
+    summary: { type: "string" },
+    filesChanged: { type: "array", items: { type: "string" } },
+    planItemsCompleted: { type: "array", items: { type: "string" } },
+    planItemsSkipped: {
+      type: "array",
+      items: {
+        type: "object",
+        additionalProperties: false,
+        required: ["item", "reason"],
+        properties: {
+          item: { type: "string" },
+          reason: { type: "string" },
+        },
+      },
+    },
+    reviewerItemsAddressed: {
+      type: "array",
+      items: {
+        type: "object",
+        additionalProperties: false,
+        required: ["item", "status", "notes"],
+        properties: {
+          item: { type: "string" },
+          status: {
+            type: "string",
+            enum: ["addressed", "partially_addressed", "not_addressed"],
+          },
+          notes: { type: "string" },
+        },
+      },
+    },
+    commandsRun: {
+      type: "array",
+      items: {
+        type: "object",
+        additionalProperties: false,
+        required: ["command", "purpose"],
+        properties: {
+          command: { type: "string" },
+          purpose: { type: "string" },
+        },
+      },
+    },
+    knownIssues: { type: "array", items: { type: "string" } },
+  },
+} as const;
 
 // --- Reviewer Output ---
 
@@ -90,6 +254,43 @@ export interface ReviewResult {
   approvalRationale?: string;
 }
 
+/** Runtime JSON Schema supplied to the reviewer for its structured handoff. */
+export const REVIEW_RESULT_JSON_SCHEMA = {
+  $schema: "https://json-schema.org/draft/2020-12/schema",
+  title: "ReviewResult",
+  type: "object",
+  additionalProperties: false,
+  required: ["status", "summary", "findings", "testsToRun", "riskNotes"],
+  properties: {
+    status: {
+      type: "string",
+      enum: ["approved", "needs_changes", "blocked"],
+    },
+    summary: { type: "string" },
+    findings: {
+      type: "array",
+      items: {
+        type: "object",
+        additionalProperties: false,
+        required: ["severity", "issue", "expectedFix", "rationale"],
+        properties: {
+          severity: {
+            type: "string",
+            enum: ["blocking", "important", "minor"],
+          },
+          file: { type: "string" },
+          issue: { type: "string" },
+          expectedFix: { type: "string" },
+          rationale: { type: "string" },
+        },
+      },
+    },
+    testsToRun: { type: "array", items: { type: "string" } },
+    riskNotes: { type: "array", items: { type: "string" } },
+    approvalRationale: { type: "string" },
+  },
+} as const;
+
 // --- Check Result ---
 
 export interface CheckResult {
@@ -98,6 +299,8 @@ export interface CheckResult {
   stdout: string;
   stderr: string;
   durationMs: number;
+  /** Path to the full persisted artifact for this result, when available. */
+  artifactPath?: string;
 }
 
 export interface CheckGroup {
@@ -192,7 +395,7 @@ export const DEFAULT_CONFIG: ConductConfig = {
     maxIterations: 5,
     requireCleanGit: true,
     requireApproval: true,
-    requirePassingChecks: true,
+    requirePassingChecks: false,
     continueAfterCheckFailure: true,
     minorFindingIterationCutoff: 3,
   },
@@ -216,8 +419,6 @@ export const DEFAULT_CONFIG: ConductConfig = {
 
 export type RunStage =
   | "idle"
-  | "initializing"
-  | "validatingWorkspace"
   | "planning"
   | "validatingPlan"
   | "implementing"

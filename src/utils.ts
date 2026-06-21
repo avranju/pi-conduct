@@ -108,15 +108,17 @@ export function slugify(text: string, maxWords: number = 3): string {
  */
 export function generateRunId(slug: string): string {
   const now = new Date();
-  const timestamp = [
+  const date = [
     now.getFullYear(),
     String(now.getMonth() + 1).padStart(2, "0"),
     String(now.getDate()).padStart(2, "0"),
+  ].join("-");
+  const time = [
     String(now.getHours()).padStart(2, "0"),
     String(now.getMinutes()).padStart(2, "0"),
     String(now.getSeconds()).padStart(2, "0"),
   ].join("");
-  return `${timestamp}-${slug}`;
+  return `${date}-${time}-${slug || "run"}`;
 }
 
 /**

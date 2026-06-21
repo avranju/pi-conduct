@@ -119,11 +119,12 @@ Usage: /conduct <task prompt>
 
 ## 4. Configuration
 
-The extension should load configuration from the first existing file in this order:
+The extension should merge configuration from these locations in order, with
+later values overriding earlier values:
 
 ```text
-.pi/conduct/config.json
-conduct.config.json
+~/.pi/agent/conduct/config.json
+<repo>/.pi/conduct/config.json
 ```
 
 If no config exists, use safe defaults and tell the user which defaults are being used.
@@ -224,8 +225,6 @@ Use an explicit state machine.
 
 ```text
 Idle
-  -> Initializing
-  -> ValidatingWorkspace
   -> Planning
   -> ValidatingPlan
   -> Implementing
@@ -449,6 +448,9 @@ Produce:
 1. A concise human-readable plan.
 2. A strict JSON object matching the ImplementationPlan schema.
 
+ImplementationPlan JSON Schema:
+{{IMPLEMENTATION_PLAN_JSON_SCHEMA}}
+
 The plan must be specific enough that a smaller coding model can implement it without re-designing the solution.
 
 Include:
@@ -531,6 +533,9 @@ Previous reviewer feedback:
 
 Relevant check output:
 {{CHECK_OUTPUT_OR_NONE}}
+
+CoderCompliance JSON Schema:
+{{CODER_COMPLIANCE_JSON_SCHEMA}}
 
 Rules:
 - Modify only files needed for the task.
@@ -629,6 +634,9 @@ Previous review history:
 
 Return a strict JSON ReviewResult object.
 
+ReviewResult JSON Schema:
+{{REVIEW_RESULT_JSON_SCHEMA}}
+
 Rules:
 - Be specific.
 - Distinguish blocking issues from minor polish.
@@ -649,9 +657,6 @@ Pseudo-code:
 async function runConductWorkflow(userPrompt: string, ctx: ExtensionContext) {
   const config = await loadAndValidateConfig(ctx.cwd);
   const run = await createRunArtifacts(config, userPrompt);
-
-  await ui.status(ctx, "Conduct: validating workspace");
-  await validateWorkspace(config);
 
   await ui.status(ctx, "Conduct: planning");
   const planRaw = await runPlanner(userPrompt, config, ctx, run);
@@ -732,7 +737,6 @@ Use stage-level progress, not token-level noise.
 Examples:
 
 ```text
-Conduct: validating workspace
 Conduct: planning with openai/gpt-5.5
 Conduct: plan created, 5 files to modify, 2 files to create
 Conduct: implementing with ollama/qwen3.5-coder-32b

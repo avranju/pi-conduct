@@ -194,7 +194,6 @@ export async function runPlanner(
   try {
     await session.prompt(prompt);
     let text = lastAssistantText(session.agent.state.messages);
-    const transcript = serializeTranscript(session.agent.state.messages);
 
     const errorMessage = session.agent.state.errorMessage;
     if (errorMessage) {
@@ -203,7 +202,7 @@ export async function runPlanner(
         plan: null,
         valid: false,
         errors: [`Planner agent error: ${errorMessage}`],
-        transcript,
+        transcript: serializeTranscript(session.agent.state.messages),
       };
     }
 
@@ -226,7 +225,7 @@ export async function runPlanner(
       plan: parsed,
       valid: validation.valid,
       errors: validation.valid ? undefined : validation.errors,
-      transcript,
+      transcript: serializeTranscript(session.agent.state.messages),
     };
   } finally {
     cleanup();
@@ -268,7 +267,6 @@ export async function runCoder(
   try {
     await session.prompt(prompt);
     let text = lastAssistantText(session.agent.state.messages);
-    const transcript = serializeTranscript(session.agent.state.messages);
 
     const errorMessage = session.agent.state.errorMessage;
     if (errorMessage) {
@@ -277,7 +275,7 @@ export async function runCoder(
         compliance: null,
         valid: false,
         errors: [`Coder agent error: ${errorMessage}`],
-        transcript,
+        transcript: serializeTranscript(session.agent.state.messages),
       };
     }
 
@@ -303,7 +301,7 @@ export async function runCoder(
         compliance: FALLBACK_COMPLIANCE,
         valid: false,
         errors: validation.errors,
-        transcript,
+        transcript: serializeTranscript(session.agent.state.messages),
       };
     }
 
@@ -311,7 +309,7 @@ export async function runCoder(
       rawResponse: text,
       compliance: parsed,
       valid: true,
-      transcript,
+      transcript: serializeTranscript(session.agent.state.messages),
     };
   } finally {
     cleanup();
@@ -343,7 +341,6 @@ export async function runReviewer(
   try {
     await session.prompt(prompt);
     let text = lastAssistantText(session.agent.state.messages);
-    const transcript = serializeTranscript(session.agent.state.messages);
 
     const errorMessage = session.agent.state.errorMessage;
     if (errorMessage) {
@@ -358,7 +355,7 @@ export async function runReviewer(
         },
         valid: false,
         errors: [`Reviewer agent error: ${errorMessage}`],
-        transcript,
+        transcript: serializeTranscript(session.agent.state.messages),
       };
     }
 
@@ -389,7 +386,7 @@ export async function runReviewer(
         },
         valid: false,
         errors: validation.errors,
-        transcript,
+        transcript: serializeTranscript(session.agent.state.messages),
       };
     }
 
@@ -397,7 +394,7 @@ export async function runReviewer(
       rawResponse: text,
       review: parsed,
       valid: true,
-      transcript,
+      transcript: serializeTranscript(session.agent.state.messages),
     };
   } finally {
     cleanup();

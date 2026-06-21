@@ -1,8 +1,11 @@
-import type {
-  ImplementationPlan,
-  CoderCompliance,
-  ReviewResult,
-  CheckResult,
+import {
+  CODER_COMPLIANCE_JSON_SCHEMA,
+  IMPLEMENTATION_PLAN_JSON_SCHEMA,
+  REVIEW_RESULT_JSON_SCHEMA,
+  type ImplementationPlan,
+  type CoderCompliance,
+  type ReviewResult,
+  type CheckResult,
 } from "./schemas.js";
 
 // ============================================================================
@@ -27,6 +30,11 @@ export function buildPlannerPrompt(
     `Produce:`,
     `1. A concise human-readable plan.`,
     `2. A strict JSON object matching the ImplementationPlan schema.`,
+    ``,
+    `ImplementationPlan JSON Schema:`,
+    `---`,
+    JSON.stringify(IMPLEMENTATION_PLAN_JSON_SCHEMA, null, 2),
+    `---`,
     ``,
     `The plan must be specific enough that a smaller coding model can implement it without re-designing the solution.`,
     ``,
@@ -100,6 +108,11 @@ export function buildCoderPrompt(
 
   parts.push(
     ``,
+    `CoderCompliance JSON Schema:`,
+    `---`,
+    JSON.stringify(CODER_COMPLIANCE_JSON_SCHEMA, null, 2),
+    `---`,
+    ``,
     `Rules:`,
     `- Modify only files needed for the task.`,
     `- Keep changes minimal and focused.`,
@@ -128,8 +141,9 @@ export function buildReviewerPrompt(
   checkOutputs: CheckResult[],
   reviewHistory: ReviewResult[],
   notes?: string,
+  checkArtifactDir?: string,
 ): string {
-  const checkOutputText = formatCheckOutputs(checkOutputs);
+  const checkOutputText = formatCheckOutputs(checkOutputs, checkArtifactDir);
   const reviewHistoryText =
     reviewHistory.length > 0
       ? reviewHistory
@@ -184,6 +198,11 @@ export function buildReviewerPrompt(
     ``,
     `Return a strict JSON ReviewResult object.`,
     ``,
+    `ReviewResult JSON Schema:`,
+    `---`,
+    JSON.stringify(REVIEW_RESULT_JSON_SCHEMA, null, 2),
+    `---`,
+    ``,
     `Rules:`,
     `- Be specific.`,
     `- Distinguish blocking issues from minor polish.`,
@@ -227,13 +246,21 @@ export function buildReviewerRepairPrompt(errors?: string[]): string {
 // Helpers
 // ============================================================================
 
-function formatCheckOutputs(checks: CheckResult[]): string {
+function formatCheckOutputs(checks: CheckResult[], checkArtifactDir?: string): string {
   if (checks.length === 0) return "(no checks configured)";
-  return checks
+  const header = checkArtifactDir ? `Full check artifacts: ${checkArtifactDir}\n\n` : "";
+  return header + checks
     .map((c) => {
       const status = c.exitCode === 0 ? "PASS" : "FAIL";
-      const output = truncate(c.stdout, 2000) || truncate(c.stderr, 2000) || "(no output)";
-      return `[${status}] ${c.command}\n${output}`;
+      const parts = [
+        `[${status}] ${c.command} (exit ${c.exitCode}, ${c.durationMs}ms)`,
+      ];
+      if (c.artifactPath) {
+        parts.push(`Full output: ${c.artifactPath}`);
+      }
+      parts.push(`stdout:\n${truncate(c.stdout, 1500) || "(empty)"}`);
+      parts.push(`stderr:\n${truncate(c.stderr, 1500) || "(empty)"}`);
+      return parts.join("\n");
     })
     .join("\n\n");
 }

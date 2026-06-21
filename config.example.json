@@ -20,7 +20,7 @@
     "maxIterations": 5,
     "requireCleanGit": true,
     "requireApproval": true,
-    "requirePassingChecks": true,
+    "requirePassingChecks": false,
     "continueAfterCheckFailure": true,
     "minorFindingIterationCutoff": 3
   },

@@ -67,7 +67,8 @@ export function evaluateRequiredChecks(
   requirePassingChecks: boolean,
 ): boolean {
   if (!requirePassingChecks) return true;
-  if (groups.length === 0) return true; // No checks configured, pass by default
+  // If checks are required, an empty command set is not evidence of passing.
+  if (groups.length === 0) return false;
 
   for (const group of groups) {
     for (const result of group.results) {
@@ -100,10 +101,17 @@ export function summarizeCheckGroups(groups: CheckGroup[]): string {
     parts.push(`--- ${group.groupName} (${status}) ---`);
     for (const result of group.results) {
       const cmdStatus = result.exitCode === 0 ? "PASS" : "FAIL";
-      const summary = truncate(result.stdout || result.stderr, 1000);
+      const stdout = truncate(result.stdout, 700);
+      const stderr = truncate(result.stderr, 700);
       parts.push(`  [${cmdStatus}] ${result.command} (exit ${result.exitCode}, ${result.durationMs}ms)`);
-      if (summary) {
-        parts.push(`    ${summary}`);
+      if (result.artifactPath) {
+        parts.push(`    Full output: ${result.artifactPath}`);
+      }
+      if (stdout) {
+        parts.push(`    stdout: ${stdout}`);
+      }
+      if (stderr) {
+        parts.push(`    stderr: ${stderr}`);
       }
     }
     parts.push("");

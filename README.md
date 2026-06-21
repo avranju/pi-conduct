@@ -63,10 +63,11 @@ Example:
 
 ## Configuration
 
-Create a config file at one of these locations (first match wins):
+Configuration is loaded from these locations, with the repository configuration
+overriding matching global settings:
 
-- `.pi/conduct/config.json`
-- `conduct.config.json`
+- `~/.pi/agent/conduct/config.json`
+- `<repo>/.pi/conduct/config.json`
 
 ### Example Config
 
@@ -130,7 +131,7 @@ Create a config file at one of these locations (first match wins):
 | `loop.maxIterations` | Max coder/reviewer loop iterations | `5` |
 | `loop.requireCleanGit` | Require clean git working tree | `true` |
 | `loop.requireApproval` | Require reviewer approval | `true` |
-| `loop.requirePassingChecks` | Require all configured checks to pass | `true` |
+| `loop.requirePassingChecks` | Require all configured checks to pass | `false` |
 | `loop.continueAfterCheckFailure` | Continue to reviewer even if checks fail | `true` |
 | `loop.minorFindingIterationCutoff` | Stop when only minor findings remain past this iteration | `3` |
 | `safety.allowNetwork` | Allow network/package-install commands in agent bash | `false` |
@@ -186,24 +187,24 @@ Every `/conduct` run gets a unique run directory:
   plan.raw.md
   plan.json
   plan.validation.json
-  iterations/
-    1/
-      coder-prompt.md
-      coder-response.md
-      coder-compliance.json
-      coder-transcript.json
-      git-diff.patch
-      git-diff-stat.txt
-      checks/
-        format-*.txt
-        lint-*.txt
-        test-*.txt
-      review-prompt.md
-      review-response.md
-      review.json
-      reviewer-transcript.json
-    2/
-      ...
+  iteration-1/
+    coder-prompt.md
+    coder-response.md
+    coder-compliance.json
+    coder-transcript.json
+    git-diff.patch
+    git-diff-stat.txt
+    checks/
+      format.txt
+      lint.txt
+      test.txt
+      results.json
+    review-prompt.md
+    review-response.md
+    review.json
+    reviewer-transcript.json
+  iteration-2/
+    ...
   final-summary.md
 ```
 
@@ -222,7 +223,7 @@ transition so a run can be inspected without trusting model prose.
   pacman/gem/composer install`, `git clone`.
 - Additional block patterns can be added via `safety.blockedCommandPatterns`
   (regex strings).
-- **No auto-commits** — all changes are visible via `git diff`.
+- **No auto-commits** — all tracked, staged, and untracked file changes are captured in Conduct diff artifacts.
 
 This is a guardrail, not a sandbox (§15). Real isolation should later use
 containers.
@@ -230,7 +231,7 @@ containers.
 ## State Machine
 
 ```
-Idle -> Initializing -> ValidatingWorkspace -> Planning
+Idle -> Planning
   -> ValidatingPlan -> Implementing -> RunningChecks -> Reviewing
   -> (loop: Fixing -> RunningChecks -> Reviewing)
   -> Completed / Failed / NeedsUserIntervention

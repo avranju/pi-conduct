@@ -1,4 +1,6 @@
 import type { ExecOptions, ExecResult } from "@earendil-works/pi-coding-agent";
+import * as fs from "node:fs";
+import * as path from "node:path";
 
 // ============================================================================
 // Git Utilities (§8)
@@ -34,35 +36,67 @@ export async function validateCleanGit(exec: Exec): Promise<{
   return { clean: status.trim() === "", status };
 }
 
-export async function collectGitDiff(exec: Exec): Promise<{ diff: string; stat: string }> {
-  const [diffResult, statResult] = await Promise.all([
-    exec("git", ["diff"], { timeout: 15_000 }),
-    exec("git", ["diff", "--stat"], { timeout: 10_000 }),
+export async function collectGitDiff(
+  exec: Exec,
+  excludePaths: string[] = [],
+): Promise<{ diff: string; stat: string }> {
+  const pathspec = await buildExcludePathspec(exec, excludePaths);
+  const pathArgs = pathspec.length > 0 ? ["--", ".", ...pathspec] : [];
+  const [unstagedDiff, stagedDiff, unstagedStat, stagedStat, untracked] = await Promise.all([
+    exec("git", ["diff", ...pathArgs], { timeout: 15_000 }),
+    exec("git", ["diff", "--cached", ...pathArgs], { timeout: 15_000 }),
+    exec("git", ["diff", "--stat", ...pathArgs], { timeout: 10_000 }),
+    exec("git", ["diff", "--cached", "--stat", ...pathArgs], { timeout: 10_000 }),
+    collectUntrackedFiles(exec, excludePaths),
   ]);
 
+  const untrackedDiff = await buildUntrackedDiff(exec, untracked);
+  const untrackedStat = await buildUntrackedStat(exec, untracked);
+
   return {
-    diff: diffResult.stdout,
-    stat: statResult.stdout,
+    diff: joinNonEmpty([
+      unstagedDiff.stdout,
+      stagedDiff.stdout,
+      untrackedDiff,
+    ]),
+    stat: joinNonEmpty([
+      unstagedStat.stdout,
+      stagedStat.stdout ? `# Staged changes\n${stagedStat.stdout}` : "",
+      untrackedStat,
+    ]),
   };
 }
 
-export async function collectGitDiffStat(exec: Exec): Promise<string> {
+export async function collectGitDiffStat(
+  exec: Exec,
+  excludePaths: string[] = [],
+): Promise<string> {
   try {
-    const result = await exec("git", ["diff", "--stat"], { timeout: 10_000 });
-    return result.stdout;
+    const diff = await collectGitDiff(exec, excludePaths);
+    return diff.stat;
   } catch {
     return "";
   }
 }
 
-export async function collectModifiedFiles(exec: Exec): Promise<string[]> {
+export async function collectModifiedFiles(
+  exec: Exec,
+  excludePaths: string[] = [],
+): Promise<string[]> {
   try {
-    const result = await exec("git", ["diff", "--name-only"], { timeout: 10_000 });
-    if (result.code !== 0 || !result.stdout.trim()) return [];
-    return result.stdout
-      .split("\n")
-      .map((l) => l.trim())
-      .filter(Boolean);
+    const pathspec = await buildExcludePathspec(exec, excludePaths);
+    const pathArgs = pathspec.length > 0 ? ["--", ".", ...pathspec] : [];
+    const [unstaged, staged, untracked] = await Promise.all([
+      exec("git", ["diff", "--name-only", ...pathArgs], { timeout: 10_000 }),
+      exec("git", ["diff", "--cached", "--name-only", ...pathArgs], { timeout: 10_000 }),
+      collectUntrackedFiles(exec, excludePaths),
+    ]);
+    const files = [
+      ...splitLines(unstaged.stdout),
+      ...splitLines(staged.stdout),
+      ...untracked,
+    ];
+    return [...new Set(files)].sort();
   } catch {
     return [];
   }
@@ -76,4 +110,142 @@ export async function getGitRoot(exec: Exec): Promise<string | null> {
   } catch {
     return null;
   }
+}
+
+function splitLines(text: string): string[] {
+  return text
+    .split("\n")
+    .map((l) => l.trim())
+    .filter(Boolean);
+}
+
+function joinNonEmpty(parts: string[]): string {
+  return parts.map((p) => p.trim()).filter(Boolean).join("\n\n");
+}
+
+async function buildExcludePathspec(exec: Exec, excludePaths: string[]): Promise<string[]> {
+  if (excludePaths.length === 0) return [];
+  const root = await getGitRoot(exec);
+  if (!root) return [];
+
+  const specs: string[] = [];
+  for (const excludePath of excludePaths) {
+    const relative = path.isAbsolute(excludePath)
+      ? path.relative(root, excludePath)
+      : excludePath;
+    if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) continue;
+    const normalized = relative.split(path.sep).join("/").replace(/\/+$/, "");
+    if (normalized) specs.push(`:(exclude)${normalized}/**`);
+  }
+  return specs;
+}
+
+async function collectUntrackedFiles(
+  exec: Exec,
+  excludePaths: string[] = [],
+): Promise<string[]> {
+  try {
+    const pathspec = await buildExcludePathspec(exec, excludePaths);
+    const pathArgs = pathspec.length > 0 ? ["--", ".", ...pathspec] : [];
+    const result = await exec("git", ["ls-files", "--others", "--exclude-standard", ...pathArgs], {
+      timeout: 10_000,
+    });
+    if (result.code !== 0) return [];
+    return splitLines(result.stdout);
+  } catch {
+    return [];
+  }
+}
+
+async function buildUntrackedDiff(exec: Exec, files: string[]): Promise<string> {
+  if (files.length === 0) return "";
+  const root = await getGitRoot(exec);
+  if (!root) return "";
+
+  const patches: string[] = [];
+  for (const file of files) {
+    patches.push(buildNewFilePatch(root, file));
+  }
+  return joinNonEmpty(patches);
+}
+
+async function buildUntrackedStat(exec: Exec, files: string[]): Promise<string> {
+  if (files.length === 0) return "";
+  const root = await getGitRoot(exec);
+  if (!root) return `# Untracked files\n${files.map((f) => ` ${f}`).join("\n")}`;
+
+  const lines = ["# Untracked files"];
+  let totalLines = 0;
+  for (const file of files) {
+    const fullPath = path.join(root, file);
+    const lineCount = countTextLines(fullPath);
+    totalLines += Math.max(lineCount, 0);
+    lines.push(` ${file} | ${lineCount >= 0 ? lineCount : "binary/large"}`);
+  }
+  if (totalLines > 0) {
+    lines.push(` ${files.length} file${files.length === 1 ? "" : "s"} changed, ${totalLines} insertion${totalLines === 1 ? "" : "s"}(+)`);
+  }
+  return lines.join("\n");
+}
+
+function buildNewFilePatch(repoRoot: string, relativeFile: string): string {
+  const fullPath = path.join(repoRoot, relativeFile);
+  if (!isSafeRepoPath(repoRoot, fullPath)) {
+    return `diff --git a/${relativeFile} b/${relativeFile}\n# Skipped unsafe untracked path`;
+  }
+
+  let stat: fs.Stats;
+  try {
+    stat = fs.statSync(fullPath);
+  } catch {
+    return `diff --git a/${relativeFile} b/${relativeFile}\n# Could not stat untracked file`;
+  }
+  if (!stat.isFile()) {
+    return `diff --git a/${relativeFile} b/${relativeFile}\n# Untracked path is not a regular file`;
+  }
+  if (stat.size > 200_000) {
+    return [
+      `diff --git a/${relativeFile} b/${relativeFile}`,
+      `new file mode 100644`,
+      `--- /dev/null`,
+      `+++ b/${relativeFile}`,
+      `# Large untracked file omitted from inline diff (${stat.size} bytes)`,
+    ].join("\n");
+  }
+
+  const buffer = fs.readFileSync(fullPath);
+  if (buffer.includes(0)) {
+    return `diff --git a/${relativeFile} b/${relativeFile}\nBinary files /dev/null and b/${relativeFile} differ`;
+  }
+
+  const text = buffer.toString("utf8");
+  const lines = text.split("\n");
+  if (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
+  return [
+    `diff --git a/${relativeFile} b/${relativeFile}`,
+    `new file mode 100644`,
+    `--- /dev/null`,
+    `+++ b/${relativeFile}`,
+    `@@ -0,0 +1,${lines.length} @@`,
+    ...lines.map((line) => `+${line}`),
+  ].join("\n");
+}
+
+function countTextLines(filePath: string): number {
+  try {
+    const stat = fs.statSync(filePath);
+    if (!stat.isFile() || stat.size > 200_000) return -1;
+    const buffer = fs.readFileSync(filePath);
+    if (buffer.includes(0)) return -1;
+    if (buffer.length === 0) return 0;
+    const text = buffer.toString("utf8");
+    return text.endsWith("\n") ? text.split("\n").length - 1 : text.split("\n").length;
+  } catch {
+    return -1;
+  }
+}
+
+function isSafeRepoPath(repoRoot: string, fullPath: string): boolean {
+  const relative = path.relative(repoRoot, fullPath);
+  return Boolean(relative) && !relative.startsWith("..") && !path.isAbsolute(relative);
 }

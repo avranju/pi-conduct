@@ -81,16 +81,6 @@ export async function runConductWorkflow(
 
   const artifactPath = runDir?.root ?? "";
 
-  // --- Initializing ---
-  updateState("initializing");
-  await status(ctx, "Conduct: initializing");
-
-  // --- Validating Workspace ---
-  // (Clean-git validation is performed by the command handler before invoking
-  //  the supervisor; this stage records that the workspace is being prepared.)
-  updateState("validatingWorkspace");
-  await status(ctx, "Conduct: validating workspace");
-
   // --- Planning ---
   updateState("planning");
   await status(
@@ -203,9 +193,10 @@ export async function runConductWorkflow(
     }
 
     // --- Collect Git Diff (§8) ---
-    const diff = await collectGitDiff(exec);
+    const artifactExcludes = runDir ? [runDir.root] : [];
+    const diff = await collectGitDiff(exec, artifactExcludes);
     lastDiffStat = diff.stat;
-    const modifiedFiles = await collectModifiedFiles(exec);
+    const modifiedFiles = await collectModifiedFiles(exec, artifactExcludes);
     lastModifiedFiles = modifiedFiles;
 
     if (runDir && config.artifacts.keepDiffs) {
@@ -306,6 +297,7 @@ export async function runConductWorkflow(
       checks.flatMap((g) => g.results),
       reviewHistory,
       reviewerNotes.length > 0 ? reviewerNotes.join("\n\n") : undefined,
+      runDir ? path.join(getIterationDir(runDir, iteration), "checks") : undefined,
     );
 
     const reviewerResult: ReviewerResult = await runReviewer(reviewerPrompt, config, ctx, signal);

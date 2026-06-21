@@ -30,9 +30,11 @@ export function createRunDirectory(
   artifactRoot: string,
   runId: string,
 ): { dir: RunDirectory; root: string } {
-  const root = path.join(artifactRoot, runId);
+  let root = path.join(artifactRoot, runId);
+  for (let suffix = 2; fs.existsSync(root); suffix++) {
+    root = path.join(artifactRoot, `${runId}-${suffix}`);
+  }
   fs.mkdirSync(root, { recursive: true });
-  fs.mkdirSync(path.join(root, "iterations"), { recursive: true });
 
   return {
     dir: {
@@ -108,7 +110,7 @@ export function saveTranscript(
 export function getIterationDir(dir: RunDirectory, iteration: number): string {
   let iterDir = dir.iterationPaths.get(iteration);
   if (!iterDir) {
-    iterDir = path.join(dir.root, "iterations", String(iteration));
+    iterDir = path.join(dir.root, `iteration-${iteration}`);
     fs.mkdirSync(iterDir, { recursive: true });
     dir.iterationPaths.set(iteration, iterDir);
   }
@@ -145,10 +147,13 @@ export function saveCheckResults(
   fs.mkdirSync(checksDir, { recursive: true });
 
   for (const group of groups) {
-    for (const result of group.results) {
-      const safeName = result.command.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 50);
-      const filePath = path.join(checksDir, `${group.groupName}-${safeName}.txt`);
-      const content = [
+    const groupFile = path.join(checksDir, `${group.groupName}.txt`);
+    const sections: string[] = [];
+
+    group.results.forEach((result, index) => {
+      result.artifactPath = groupFile;
+      sections.push(
+        `# ${group.groupName} command ${index + 1}`,
         `Command: ${result.command}`,
         `Exit Code: ${result.exitCode}`,
         `Duration: ${result.durationMs}ms`,
@@ -158,10 +163,15 @@ export function saveCheckResults(
         ``,
         `--- stderr ---`,
         result.stderr || "(empty)",
-      ].join("\n");
-      writeText(filePath, content);
-    }
+        ``,
+      );
+    });
+
+    writeText(groupFile, sections.join("\n"));
   }
+
+  // Machine-readable capture of the exact command result shape requested by §9.
+  writeJson(path.join(checksDir, "results.json"), groups);
 }
 
 export function saveReviewerPrompt(iterationDir: string, prompt: string): void {

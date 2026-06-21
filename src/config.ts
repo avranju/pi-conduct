@@ -1,50 +1,49 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import type { ConductConfig } from "./schemas.js";
 import { DEFAULT_CONFIG } from "./schemas.js";
 
 // --- Config Loading (§4) ---
 
-export function findConfigFile(cwd: string): string | null {
-  const candidates = [
+export function findConfigFiles(cwd: string, agentDir = getAgentDir()): string[] {
+  return [
+    path.join(agentDir, "conduct", "config.json"),
     path.join(cwd, ".pi", "conduct", "config.json"),
-    path.join(cwd, "conduct.config.json"),
-  ];
-  for (const candidate of candidates) {
-    if (fs.existsSync(candidate)) {
-      return candidate;
-    }
-  }
-  return null;
+  ].filter((candidate) => fs.existsSync(candidate));
 }
 
 export interface LoadConfigResult {
   config: ConductConfig;
   warnings: string[];
-  configPath: string | null;
+  configPaths: string[];
 }
 
-export function loadConfig(cwd: string): LoadConfigResult {
-  const configPath = findConfigFile(cwd);
+export function loadConfig(cwd: string, agentDir = getAgentDir()): LoadConfigResult {
+  const configPaths = findConfigFiles(cwd, agentDir);
   const warnings: string[] = [];
+  let config = structuredClone(DEFAULT_CONFIG);
 
-  if (!configPath) {
+  if (configPaths.length === 0) {
     warnings.push("No config file found. Using safe defaults.");
-    warnings.push("  See .pi/conduct/config.json or conduct.config.json");
-    return { config: structuredClone(DEFAULT_CONFIG), warnings, configPath: null };
+    warnings.push(`  See ${path.join(agentDir, "conduct", "config.json")}`);
+    warnings.push("  Or <repo>/.pi/conduct/config.json");
+    return { config, warnings: [...warnings, ...validateConfig(config)], configPaths };
   }
 
-  try {
-    const raw = fs.readFileSync(configPath, "utf-8");
-    const parsed = JSON.parse(raw) as Partial<ConductConfig>;
-    const config = mergeConfig(DEFAULT_CONFIG, parsed);
-    const validationWarnings = validateConfig(config);
-    return { config, warnings: [...warnings, ...validationWarnings], configPath };
-  } catch (err: unknown) {
-    const message = err instanceof Error ? err.message : String(err);
-    warnings.push(`Failed to parse config at ${configPath}: ${message}`);
-    return { config: structuredClone(DEFAULT_CONFIG), warnings, configPath };
+  // Apply the global config first, then layer the repository config over it.
+  for (const configPath of configPaths) {
+    try {
+      const raw = fs.readFileSync(configPath, "utf-8");
+      const parsed = JSON.parse(raw) as Partial<ConductConfig>;
+      config = mergeConfig(config, parsed);
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      warnings.push(`Failed to parse config at ${configPath}: ${message}`);
+    }
   }
+
+  return { config, warnings: [...warnings, ...validateConfig(config)], configPaths };
 }
 
 function mergeConfig(base: ConductConfig, override: Partial<ConductConfig>): ConductConfig {
@@ -102,8 +101,13 @@ function validateConfig(config: ConductConfig): string[] {
     }
   }
 
-  // §4.2.4: Invalid artifact root
-  if (!config.artifacts.root || config.artifacts.root.trim() === "") {
+  // §4.2.4: Invalid artifact root. Keep MVP artifacts inside the repo.
+  if (
+    !config.artifacts.root ||
+    config.artifacts.root.trim() === "" ||
+    path.isAbsolute(config.artifacts.root) ||
+    config.artifacts.root.split(/[\\/]+/).includes("..")
+  ) {
     warnings.push("WARNING: Invalid artifact root, using default .pi/conduct/runs");
     config.artifacts.root = ".pi/conduct/runs";
   }

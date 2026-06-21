@@ -44,22 +44,79 @@ export default function conductExtension(pi: ExtensionAPI) {
       }
 
       // --- Load Config (§4) ---
-      const { config, warnings, configPath } = loadConfig(ctx.cwd);
+      const { config, warnings, configPaths } = loadConfig(ctx.cwd);
       for (const warning of warnings) {
         ctx.ui.notify(warning, "warning");
       }
-      if (!configPath) {
+      if (configPaths.length === 0) {
         ctx.ui.notify("Using safe default config (no config file found)", "info");
       }
 
+      // --- Prepare Run Directory (§7) ---
+      const slug = slugify(userPrompt, 3);
+      const runId = generateRunId(slug);
+      const artifactRoot = path.join(ctx.cwd, config.artifacts.root);
+      const createRun = () => {
+        const { dir } = createRunDirectory(artifactRoot, runId);
+        saveUserPrompt(dir, userPrompt);
+        // Save the resolved config for transparency and debugging, even if it
+        // was all defaults or had parsing errors. This lets the user be able
+        // to see exactly what config was used for the run.
+        saveConfig(dir, config);
+        return dir;
+      };
+
+      if (
+        config.loop.requirePassingChecks &&
+        config.commands.format.length === 0 &&
+        config.commands.lint.length === 0 &&
+        config.commands.test.length === 0
+      ) {
+        const runDir = createRun();
+        const summary = [
+          "Conduct stopped before approval.",
+          "",
+          "Reason: requirePassingChecks is true but no check commands are configured.",
+          "",
+          "Current state:",
+          "- No agents were started.",
+          "- Add commands.format, commands.lint, or commands.test, or set loop.requirePassingChecks to false.",
+          "",
+          "Artifacts:",
+          runDir.root,
+        ].join("\n");
+        saveFinalSummary(runDir, summary);
+        ctx.ui.notify(summary, "error");
+        return;
+      }
+
       // --- Validate Clean Git (§8) ---
+      // Check before writing run artifacts when the tree is clean; if already
+      // dirty, create a failure run afterward so even aborts have artifacts.
       if (config.loop.requireCleanGit) {
         const { clean, status: gitStatus } = await validateCleanGit(exec);
         if (!clean) {
+          const runDir = createRun();
+          const summary = [
+            "Conduct stopped before approval.",
+            "",
+            "Reason: Working tree is not clean.",
+            "",
+            "Current state:",
+            "- No agents were started.",
+            "- Git status:",
+            gitStatus.trim() || "(empty)",
+            "",
+            "Artifacts:",
+            runDir.root,
+          ].join("\n");
+          saveFinalSummary(runDir, summary);
           const msg = [
             "Working tree is not clean. Aborting.",
             "Git status:",
             gitStatus.slice(0, 500),
+            "",
+            `Artifacts: ${runDir.root}`,
             "",
             "Future: use /conduct --allow-dirty <prompt> (not yet implemented).",
           ].join("\n");
@@ -68,14 +125,7 @@ export default function conductExtension(pi: ExtensionAPI) {
         }
       }
 
-      // --- Create Run Directory (§7) ---
-      const slug = slugify(userPrompt, 3);
-      const runId = generateRunId(slug);
-      const artifactRoot = path.join(ctx.cwd, config.artifacts.root);
-      const { dir: runDir, root: runRoot } = createRunDirectory(artifactRoot, runId);
-
-      saveUserPrompt(runDir, userPrompt);
-      saveConfig(runDir, config);
+      const runDir = createRun();
 
       // --- Gather Repository Context ---
       const repoContext = await gatherRepoContext(ctx.cwd, exec);
