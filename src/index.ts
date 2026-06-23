@@ -13,10 +13,19 @@ import {
   saveUserPrompt,
   saveConfig,
   saveFinalSummary,
+  acquireRunLock,
+  type RunDirectory,
 } from "./artifacts.js";
 import { ConductProgress } from "./ui.js";
 import { runConductWorkflow, type WorkflowResult } from "./supervisor.js";
 import { generateRunId, slugify } from "./utils.js";
+import {
+  loadResumeRun,
+  markRunInterrupted,
+  type ResumeWorkflowData,
+} from "./resume.js";
+import type { ConductConfig } from "./schemas.js";
+import { getLiveOutputKeybindings, matchesAnyKey } from "./keybindings.js";
 
 // ============================================================================
 // Pi Conduct Extension - Entry Point (§3)
@@ -38,25 +47,156 @@ export default function conductExtension(pi: ExtensionAPI) {
     return new UserMessageComponent(text);
   });
 
-  pi.registerShortcut(Key.ctrlAlt("d"), {
-    description: "Show live Conduct sub-agent output",
-    handler: async (ctx) => {
-      if (!activeProgress) {
-        ctx.ui.notify("No Conduct workflow is active", "info");
-        return;
+  const startupConfig = loadConfig(process.cwd()).config;
+  for (const shortcut of getLiveOutputKeybindings(startupConfig)) {
+    pi.registerShortcut(shortcut, {
+      description: "Show live Conduct sub-agent output",
+      handler: async (ctx) => {
+        if (!activeProgress) {
+          ctx.ui.notify("No Conduct workflow is active", "info");
+          return;
+        }
+        await activeProgress.showDetails(ctx);
+      },
+    });
+  }
+
+  const executeRun = async (
+    userPrompt: string,
+    config: ConductConfig,
+    ctx: ExtensionCommandContext,
+    exec: Exec,
+    repoContext: string,
+    runDir: RunDirectory,
+    resume?: ResumeWorkflowData,
+  ): Promise<void> => {
+    let releaseLock: (() => void) | undefined;
+    try {
+      releaseLock = acquireRunLock(runDir);
+    } catch (error) {
+      ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+      return;
+    }
+
+    const controller = new AbortController();
+    const liveOutputKeybindings = getLiveOutputKeybindings(config);
+    const progress = new ConductProgress(ctx, liveOutputKeybindings);
+    activeProgress?.clear();
+    activeProgress = progress;
+    let cancellationConfirmationOpen = false;
+    let cancellationConfirmationController: AbortController | undefined;
+    let workflowSettled = false;
+
+    const requestCancellation = async (): Promise<void> => {
+      if (cancellationConfirmationOpen || controller.signal.aborted) return;
+      cancellationConfirmationOpen = true;
+      const confirmationController = new AbortController();
+      cancellationConfirmationController = confirmationController;
+      try {
+        const confirmed = await ctx.ui.confirm(
+          "Cancel Conduct workflow?",
+          "The active sub-agent or check command will be stopped. Any file changes already made will remain in the working tree and the run can be resumed.",
+          { signal: confirmationController.signal },
+        );
+        if (confirmed && !workflowSettled && !controller.signal.aborted) {
+          progress.setActivity("Cancelling workflow…");
+          controller.abort();
+        }
+      } catch {
+        // The workflow may finish while the confirmation dialog is open.
+      } finally {
+        if (cancellationConfirmationController === confirmationController) {
+          cancellationConfirmationController = undefined;
+        }
+        cancellationConfirmationOpen = false;
       }
-      await activeProgress.showDetails(ctx);
-    },
-  });
+    };
+
+    const showDetailsOnShortcut = ctx.ui.onTerminalInput((data) => {
+      if (
+        isKeyRelease(data) ||
+        progress.isShowingDetails() ||
+        cancellationConfirmationOpen ||
+        !matchesAnyKey(data, liveOutputKeybindings)
+      ) return;
+      void progress.showDetails(ctx);
+      return { consume: true };
+    });
+
+    const cancelOnEscape = ctx.ui.onTerminalInput((data) => {
+      if (
+        isKeyRelease(data) ||
+        !matchesKey(data, Key.escape) ||
+        progress.isShowingDetails() ||
+        cancellationConfirmationOpen
+      ) return;
+      void requestCancellation();
+      return { consume: true };
+    });
+    const forwardHostAbort = () => controller.abort();
+    if (ctx.signal) {
+      if (ctx.signal.aborted) controller.abort();
+      else ctx.signal.addEventListener("abort", forwardHostAbort, { once: true });
+    }
+
+    let result: WorkflowResult;
+    try {
+      result = await runConductWorkflow(
+        userPrompt,
+        config,
+        ctx,
+        exec,
+        repoContext,
+        runDir,
+        controller.signal,
+        progress,
+        resume,
+      );
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      const summary = [
+        `Conduct was interrupted by an unexpected error: ${message}`,
+        "",
+        `Resume with: /conduct resume ${path.basename(runDir.root)}`,
+      ].join("\n");
+      try {
+        await markRunInterrupted(runDir, exec, message, "unexpected");
+      } catch {
+        // Preserve the original failure when checkpointing also fails.
+      }
+      saveFinalSummary(runDir, summary);
+      progress.failStep(message);
+      progress.finish();
+      const progressLines = progress.getSummaryLines();
+      progress.clear();
+      if (activeProgress === progress) activeProgress = undefined;
+      ctx.ui.notify([summary, "", ...progressLines].join("\n"), "error");
+      return;
+    } finally {
+      workflowSettled = true;
+      cancellationConfirmationController?.abort();
+      showDetailsOnShortcut();
+      cancelOnEscape();
+      ctx.signal?.removeEventListener("abort", forwardHostAbort);
+      releaseLock?.();
+    }
+
+    saveFinalSummary(runDir, result.summary);
+    const progressLines = progress.getSummaryLines();
+    progress.clear();
+    if (activeProgress === progress) activeProgress = undefined;
+    await printFinalSummary(result, ctx, progressLines);
+  };
 
   pi.registerCommand("conduct", {
     description: "Run the Pi Conduct multi-agent coding workflow",
     handler: async (args: string, ctx: ExtensionCommandContext) => {
-      const userPrompt = args.trim();
+      const commandArgs = args.trim();
+      const resumeMatch = /^resume(?:\s+(.+))?$/.exec(commandArgs);
 
       // §3: validate input
-      if (!userPrompt) {
-        ctx.ui.notify("Usage: /conduct <task prompt>", "error");
+      if (!commandArgs || (resumeMatch && !resumeMatch[1]?.trim())) {
+        ctx.ui.notify("Usage: /conduct <task prompt> | /conduct resume <run-id>", "error");
         return;
       }
 
@@ -64,15 +204,6 @@ export default function conductExtension(pi: ExtensionAPI) {
         ctx.ui.notify("Conduct requires interactive TUI mode", "error");
         return;
       }
-
-      // Slash commands are not rendered as user messages by Pi. Persist the
-      // task as a non-triggering custom message and render it with Pi's native
-      // user-message component so the task remains visible above progress.
-      pi.sendMessage({
-        customType: CONDUCT_PROMPT_MESSAGE_TYPE,
-        content: userPrompt,
-        display: true,
-      });
 
       const exec: Exec = pi.exec.bind(pi);
 
@@ -84,13 +215,53 @@ export default function conductExtension(pi: ExtensionAPI) {
       }
 
       // --- Load Config (§4) ---
-      const { config, warnings, configPaths } = loadConfig(ctx.cwd);
+      const { config: currentConfig, warnings, configPaths } = loadConfig(ctx.cwd);
       for (const warning of warnings) {
         ctx.ui.notify(warning, "warning");
       }
       if (configPaths.length === 0) {
         ctx.ui.notify("Using safe default config (no config file found)", "info");
       }
+
+      if (resumeMatch) {
+        const requestedRunId = resumeMatch[1]!.trim();
+        const artifactRoot = path.join(ctx.cwd, currentConfig.artifacts.root);
+        try {
+          const loaded = await loadResumeRun(artifactRoot, requestedRunId, gitRoot, exec);
+          pi.sendMessage({
+            customType: CONDUCT_PROMPT_MESSAGE_TYPE,
+            content: `Resume Conduct run ${requestedRunId}\n\n${loaded.userPrompt}`,
+            display: true,
+          });
+          const repoContext = await gatherRepoContext(ctx.cwd, exec);
+          await executeRun(
+            loaded.userPrompt,
+            loaded.config,
+            ctx,
+            exec,
+            repoContext,
+            loaded.dir,
+            loaded.resume,
+          );
+        } catch (error) {
+          ctx.ui.notify(
+            `Cannot resume Conduct run: ${error instanceof Error ? error.message : String(error)}`,
+            "error",
+          );
+        }
+        return;
+      }
+
+      const userPrompt = commandArgs;
+      const config = currentConfig;
+      // Slash commands are not rendered as user messages by Pi. Persist the
+      // task as a non-triggering custom message and render it with Pi's native
+      // user-message component so the task remains visible above progress.
+      pi.sendMessage({
+        customType: CONDUCT_PROMPT_MESSAGE_TYPE,
+        content: userPrompt,
+        display: true,
+      });
 
       // --- Prepare Run Directory (§7) ---
       const slug = slugify(userPrompt, 3);
@@ -169,108 +340,7 @@ export default function conductExtension(pi: ExtensionAPI) {
 
       // --- Gather Repository Context ---
       const repoContext = await gatherRepoContext(ctx.cwd, exec);
-
-      // --- Workflow abort signal ---
-      // ctx.signal is typically undefined in command handlers (the host agent is
-      // idle), so create an internal controller and forward the host signal if
-      // present.
-      const controller = new AbortController();
-      const progress = new ConductProgress(ctx);
-      activeProgress?.clear();
-      activeProgress = progress;
-
-      let cancellationConfirmationOpen = false;
-      let cancellationConfirmationController: AbortController | undefined;
-      let workflowSettled = false;
-
-      const requestCancellation = async (): Promise<void> => {
-        if (cancellationConfirmationOpen || controller.signal.aborted) return;
-
-        cancellationConfirmationOpen = true;
-        const confirmationController = new AbortController();
-        cancellationConfirmationController = confirmationController;
-        try {
-          const confirmed = await ctx.ui.confirm(
-            "Cancel Conduct workflow?",
-            "The active sub-agent or check command will be stopped. Any file changes already made will remain in the working tree.",
-            { signal: confirmationController.signal },
-          );
-          if (confirmed && !workflowSettled && !controller.signal.aborted) {
-            progress.setActivity("Cancelling workflow…");
-            controller.abort();
-          }
-        } catch {
-          // The workflow may finish while the confirmation dialog is open.
-        } finally {
-          if (cancellationConfirmationController === confirmationController) {
-            cancellationConfirmationController = undefined;
-          }
-          cancellationConfirmationOpen = false;
-        }
-      };
-
-      const cancelOnEscape = ctx.ui.onTerminalInput((data) => {
-        if (
-          isKeyRelease(data) ||
-          !matchesKey(data, Key.escape) ||
-          progress.isShowingDetails() ||
-          cancellationConfirmationOpen
-        ) {
-          return;
-        }
-        void requestCancellation();
-        return { consume: true };
-      });
-
-      const forwardHostAbort = () => controller.abort();
-      if (ctx.signal) {
-        if (ctx.signal.aborted) controller.abort();
-        else ctx.signal.addEventListener("abort", forwardHostAbort, { once: true });
-      }
-      const signal = controller.signal;
-
-      // --- Run Workflow ---
-      let result: WorkflowResult;
-      try {
-        result = await runConductWorkflow(
-          userPrompt,
-          config,
-          ctx,
-          exec,
-          repoContext,
-          runDir,
-          signal,
-          progress,
-        );
-      } catch (err: unknown) {
-        const message = err instanceof Error ? err.message : String(err);
-        const summary = `Conduct failed with an unexpected error: ${message}`;
-        saveFinalSummary(runDir, summary);
-        progress.failStep(message);
-        progress.finish();
-        const progressLines = progress.getSummaryLines();
-        progress.clear();
-        if (activeProgress === progress) activeProgress = undefined;
-        ctx.ui.notify([summary, "", ...progressLines].join("\n"), "error");
-        return;
-      } finally {
-        workflowSettled = true;
-        cancellationConfirmationController?.abort();
-        cancelOnEscape();
-        ctx.signal?.removeEventListener("abort", forwardHostAbort);
-      }
-
-      // --- Save Final Summary ---
-      saveFinalSummary(runDir, result.summary);
-
-      // Move the terminal progress rows into normal chat content before
-      // removing the widget. Subsequent Pi messages then render below them.
-      const progressLines = progress.getSummaryLines();
-      progress.clear();
-      if (activeProgress === progress) activeProgress = undefined;
-
-      // --- Print Final Summary (§17) ---
-      await printFinalSummary(result, ctx, progressLines);
+      await executeRun(userPrompt, config, ctx, exec, repoContext, runDir);
 
     },
   });
@@ -365,6 +435,10 @@ async function printFinalSummary(
 
   lines.push("");
   lines.push(`Artifacts: ${result.artifactPath}`);
+
+  if (result.resumable) {
+    lines.push(`Resume with: /conduct resume ${path.basename(result.artifactPath)}`);
+  }
 
   if (progressLines.length > 0) {
     lines.push("");

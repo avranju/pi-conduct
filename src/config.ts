@@ -2,7 +2,8 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import type { ConductConfig } from "./schemas.js";
-import { DEFAULT_CONFIG } from "./schemas.js";
+import { DEFAULT_CONFIG, DEFAULT_LIVE_OUTPUT_KEYBINDING } from "./schemas.js";
+import { normalizeKeybindingList } from "./keybindings.js";
 
 // --- Config Loading (§4) ---
 
@@ -61,6 +62,7 @@ function mergeConfig(base: ConductConfig, override: Partial<ConductConfig>): Con
       test: override.commands?.test ?? base.commands.test,
     },
     artifacts: { ...base.artifacts, ...(override.artifacts ?? {}) },
+    keybindings: { ...base.keybindings, ...(override.keybindings ?? {}) },
   };
 }
 
@@ -98,6 +100,22 @@ function validateConfig(config: ConductConfig): string[] {
     }
     if (config.commands.test.length === 0) {
       warnings.push("WARNING: requirePassingChecks is true but no test commands configured");
+    }
+  }
+
+  const rawKeybindings = (config as { keybindings?: { liveOutput?: unknown } }).keybindings;
+  if (!rawKeybindings || typeof rawKeybindings !== "object") {
+    warnings.push("WARNING: Missing keybindings config, using platform default live output shortcut");
+    config.keybindings = { liveOutput: [DEFAULT_LIVE_OUTPUT_KEYBINDING] };
+  } else {
+    const liveOutput = normalizeKeybindingList(rawKeybindings.liveOutput);
+    if (liveOutput.length === 0) {
+      warnings.push(
+        `WARNING: keybindings.liveOutput is empty or invalid, using ${DEFAULT_LIVE_OUTPUT_KEYBINDING}`,
+      );
+      config.keybindings.liveOutput = [DEFAULT_LIVE_OUTPUT_KEYBINDING];
+    } else {
+      config.keybindings.liveOutput = liveOutput;
     }
   }
 

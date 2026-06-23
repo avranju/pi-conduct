@@ -7,10 +7,12 @@ import type {
   ReviewResult,
   RunState,
   RunStage,
+  ResumeAction,
 } from "./schemas.js";
 import { emptyRunState } from "./schemas.js";
 import type { RunDirectory } from "./artifacts.js";
 import { ConductProgress, notify } from "./ui.js";
+import { getLiveOutputKeybindings } from "./keybindings.js";
 import {
   runPlanner,
   runCoder,
@@ -26,7 +28,7 @@ import {
   type CheckGroup,
 } from "./checks.js";
 import type { Exec } from "./git.js";
-import { collectGitDiff, collectModifiedFiles } from "./git.js";
+import { collectGitDiff, collectModifiedFiles, fingerprintWorkspace } from "./git.js";
 import {
   savePlannerPrompt,
   savePlanRaw,
@@ -34,7 +36,7 @@ import {
   savePlanValidation,
   saveState,
   saveTranscript,
-  getIterationDir,
+  getIterationAttemptDir,
   saveCoderPrompt,
   saveCoderArtifacts,
   saveGitDiff,
@@ -45,6 +47,7 @@ import {
 } from "./artifacts.js";
 import { buildPlannerPrompt, buildCoderPrompt, buildReviewerPrompt } from "./prompts.js";
 import { countFindings, hasNonMinorFindings, truncate } from "./utils.js";
+import { initializeRunIdentity, type ResumeWorkflowData } from "./resume.js";
 
 // ============================================================================
 // Supervisor - Main Workflow Orchestrator (§6, §13)
@@ -59,6 +62,7 @@ export interface WorkflowResult {
   artifactPath: string;
   lastChecks?: CheckGroup[];
   lastReview?: ReviewResult;
+  resumable?: boolean;
 }
 
 export async function runConductWorkflow(
@@ -69,38 +73,83 @@ export async function runConductWorkflow(
   repoContext: string,
   runDir?: RunDirectory,
   signal?: AbortSignal,
-  progress = new ConductProgress(ctx),
+  progress = new ConductProgress(ctx, getLiveOutputKeybindings(config)),
+  resume?: ResumeWorkflowData,
 ): Promise<WorkflowResult> {
-  const state: RunState = emptyRunState(config.loop.maxIterations);
+  const state: RunState = resume
+    ? {
+        ...resume.state,
+        status: "running",
+        attempt: resume.state.attempt + 1,
+        error: undefined,
+        interruptionKind: undefined,
+        updatedAt: new Date().toISOString(),
+      }
+    : emptyRunState(config.loop.maxIterations);
 
-  const updateState = (stage: RunStage, patch: Partial<RunState> = {}): void => {
+  const updateState = (
+    stage: RunStage,
+    resumeAction: ResumeAction,
+    patch: Partial<RunState> = {},
+  ): void => {
     state.stage = stage;
+    state.resumeAction = resumeAction;
     Object.assign(state, patch);
+    state.updatedAt = new Date().toISOString();
+    if (runDir) saveState(runDir, state);
+  };
+
+  const checkpoint = async (
+    stage: RunStage,
+    resumeAction: ResumeAction,
+    patch: Partial<RunState> = {},
+  ): Promise<void> => {
+    if (runDir) state.workspaceFingerprint = await fingerprintWorkspace(exec, [runDir.root]);
+    updateState(stage, resumeAction, patch);
+  };
+
+  const setStatus = (
+    status: RunState["status"],
+    error?: string,
+  ): void => {
+    state.status = status;
+    state.error = error;
     state.updatedAt = new Date().toISOString();
     if (runDir) saveState(runDir, state);
   };
 
   const artifactPath = runDir?.root ?? "";
 
-  const finishCancelled = (
+  if (!resume) await initializeRunIdentity(state, runDir, exec);
+  if (runDir) saveState(runDir, state);
+
+  const finishInterrupted = async (
+    reason: string,
+    kind: "cancelled" | "agent" | "unexpected",
     iterations: number,
     modifiedFiles: string[] = [],
     checks: CheckGroup[] = [],
     review: ReviewResult | null = null,
     diffStat = "",
-  ): WorkflowResult => {
-    const reason = "Workflow cancelled";
-    const summary = buildFailureSummary(
+  ): Promise<WorkflowResult> => {
+    const summary = [buildFailureSummary(
       reason,
       userPrompt,
       checks,
       review,
       { stat: diffStat, modifiedFiles },
       artifactPath,
-    );
-    updateState("failed", { error: reason });
+    ), "", `Resume with: /conduct resume ${path.basename(artifactPath)}`].join("\n");
+    state.status = "interrupted";
+    state.error = reason;
+    state.interruptionKind = kind;
+    if (runDir) {
+      state.workspaceFingerprint = await fingerprintWorkspace(exec, [runDir.root]);
+      state.updatedAt = new Date().toISOString();
+      saveState(runDir, state);
+    }
     if (runDir) saveFinalSummary(runDir, summary);
-    progress.failStep("Cancelled by user");
+    progress.failStep(kind === "cancelled" ? "Cancelled by user" : reason);
     progress.finish();
     return {
       success: false,
@@ -111,143 +160,130 @@ export async function runConductWorkflow(
       artifactPath,
       lastChecks: checks.length > 0 ? checks : undefined,
       lastReview: review ?? undefined,
+      resumable: true,
     };
   };
 
-  // --- Planning ---
-  updateState("planning");
-  progress.startStep(
-    "Planning",
-    "Starting planner sub-agent…",
-    config.models.planner,
-  );
-
-  const plannerPrompt = buildPlannerPrompt(userPrompt, repoContext);
-  if (runDir) savePlannerPrompt(runDir, plannerPrompt);
-
-  const plannerResult: PlannerResult = await runPlanner(
-    plannerPrompt,
-    config,
-    ctx,
-    signal,
-    progress,
-  );
-
-  if (runDir) {
-    savePlanRaw(runDir, plannerResult.rawResponse);
-    if (plannerResult.plan) savePlanJson(runDir, plannerResult.plan);
-    savePlanValidation(runDir, plannerResult.valid, plannerResult.errors);
-    saveTranscript(
-      runDir,
-      path.join(runDir.root, "planner-transcript.json"),
-      plannerResult.transcript,
-      config.artifacts.keepTranscripts,
+  let plan: ImplementationPlan | undefined = resume?.plan;
+  if (!plan || state.resumeAction === "planning") {
+    updateState("planning", "planning", { iteration: 0 });
+    progress.startStep("Planning", "Starting planner sub-agent…", config.models.planner);
+    const plannerPrompt = buildPlannerPrompt(userPrompt, repoContext);
+    if (runDir) savePlannerPrompt(runDir, plannerPrompt);
+    const plannerResult: PlannerResult = await runPlanner(
+      plannerPrompt, config, ctx, signal, progress,
     );
-  }
-
-  if (signal?.aborted) return finishCancelled(0);
-
-  // --- Validating Plan ---
-  updateState("validatingPlan", { planValid: plannerResult.valid });
-
-  if (!plannerResult.valid || !plannerResult.plan) {
-    const reason = `Planner output validation failed: ${plannerResult.errors?.join(", ") ?? "unknown"}`;
-    updateState("failed", { error: reason });
-    progress.failStep("Plan validation failed");
-    notify(ctx, `Plan validation failed: ${plannerResult.errors?.join(", ")}`, "error");
-    const summary = buildFailureSummary(reason, userPrompt, [], null, null, artifactPath);
-    if (runDir) saveFinalSummary(runDir, summary);
-    progress.finish();
-    return {
-      success: false,
-      reason,
-      iterations: 0,
-      modifiedFiles: [],
-      summary,
-      artifactPath,
-    };
-  }
-
-  const plan: ImplementationPlan = plannerResult.plan;
-  progress.completeStep();
-
-  // --- Implementation Loop ---
-  let reviewHistory: ReviewResult[] = [];
-  let lastReview: ReviewResult | null = null;
-  let lastChecks: CheckGroup[] = [];
-  let lastCoderCompliance: CoderCompliance | null = null;
-  let lastModifiedFiles: string[] = [];
-  let lastDiffStat = "";
-
-  for (let iteration = 1; iteration <= config.loop.maxIterations; iteration++) {
-    if (signal?.aborted) break;
-    updateState(iteration === 1 ? "implementing" : "fixing", { iteration });
-
-    // --- Coder ---
-    progress.startStep(
-      iteration === 1
-        ? `Implementation ${iteration}/${config.loop.maxIterations}`
-        : `Fixing review feedback ${iteration}/${config.loop.maxIterations}`,
-      "Starting coder sub-agent…",
-      config.models.coder,
-    );
-
-    const previousFeedback = lastReview
-      ? lastReview.findings
-          .map((f) => `[${f.severity}] ${f.issue} → ${f.expectedFix}`)
-          .join("\n")
-      : "";
-    const checkOutputText = lastChecks.length > 0 ? summarizeCheckGroups(lastChecks) : "";
-
-    const coderPrompt = buildCoderPrompt(
-      userPrompt,
-      plan,
-      iteration,
-      previousFeedback,
-      checkOutputText,
-    );
-
-    const coderResult: CoderResult = await runCoder(
-      coderPrompt,
-      config,
-      ctx,
-      signal,
-      progress,
-    );
-    lastCoderCompliance = coderResult.compliance;
-
     if (runDir) {
-      const iterDir = getIterationDir(runDir, iteration);
-      saveCoderPrompt(iterDir, coderPrompt);
-      saveCoderArtifacts(
-        iterDir,
-        coderResult.rawResponse,
-        coderResult.compliance ?? {
-          summary: "(none)",
-          filesChanged: [],
-          planItemsCompleted: [],
-          planItemsSkipped: [],
-          reviewerItemsAddressed: [],
-          commandsRun: [],
-          knownIssues: coderResult.errors ?? [],
-        },
-      );
+      savePlanRaw(runDir, plannerResult.rawResponse);
+      if (plannerResult.plan) savePlanJson(runDir, plannerResult.plan);
+      savePlanValidation(runDir, plannerResult.valid, plannerResult.errors);
       saveTranscript(
         runDir,
-        path.join(iterDir, "coder-transcript.json"),
-        coderResult.transcript,
+        path.join(runDir.root, "planner-transcript.json"),
+        plannerResult.transcript,
         config.artifacts.keepTranscripts,
       );
     }
-
     if (signal?.aborted) {
-      return finishCancelled(
-        iteration,
-        lastModifiedFiles,
-        lastChecks,
-        lastReview,
-        lastDiffStat,
+      return finishInterrupted("Workflow cancelled", "cancelled", 0);
+    }
+    if (plannerResult.interrupted) {
+      return finishInterrupted(
+        plannerResult.errors?.join(", ") ?? "Planner agent was interrupted",
+        "agent",
+        0,
       );
+    }
+    updateState("validatingPlan", "planning", { planValid: plannerResult.valid });
+    if (!plannerResult.valid || !plannerResult.plan) {
+      const reason = `Planner output validation failed: ${plannerResult.errors?.join(", ") ?? "unknown"}`;
+      setStatus("failed", reason);
+      progress.failStep("Plan validation failed");
+      notify(ctx, `Plan validation failed: ${plannerResult.errors?.join(", ")}`, "error");
+      const summary = buildFailureSummary(reason, userPrompt, [], null, null, artifactPath);
+      if (runDir) saveFinalSummary(runDir, summary);
+      progress.finish();
+      return { success: false, reason, iterations: 0, modifiedFiles: [], summary, artifactPath };
+    }
+    plan = plannerResult.plan;
+    progress.completeStep();
+    await checkpoint("implementing", "coder", { iteration: 1, planValid: true });
+  }
+
+  if (!plan) throw new Error("Conduct has no implementation plan");
+
+  // --- Implementation Loop ---
+  const reviewHistory: ReviewResult[] = [...(resume?.reviewHistory ?? [])];
+  let lastReview: ReviewResult | null = reviewHistory.at(-1) ?? null;
+  let lastChecks: CheckGroup[] = resume?.lastChecks ?? [];
+  let lastCoderCompliance: CoderCompliance | null = resume?.lastCoderCompliance ?? null;
+  let lastModifiedFiles: string[] = [];
+  let lastDiffStat = "";
+
+  const firstIteration = resume && resume.state.resumeAction !== "planning"
+    ? Math.max(resume.state.iteration, 1)
+    : 1;
+
+  for (let iteration = firstIteration; iteration <= config.loop.maxIterations; iteration++) {
+    if (signal?.aborted) break;
+    let action: ResumeAction =
+      resume && iteration === firstIteration && resume.state.resumeAction !== "planning"
+        ? resume.state.resumeAction
+        : "coder";
+    const coderStage: RunStage = iteration === 1 ? "implementing" : "fixing";
+    let coderResult: CoderResult = {
+      rawResponse: "",
+      compliance: lastCoderCompliance,
+      valid: lastCoderCompliance !== null,
+      transcript: "[]",
+    };
+
+    if (action !== "coder") {
+      progress.startStep(
+        `Resume iteration ${iteration}/${config.loop.maxIterations}`,
+        action === "checks" ? "Re-running configured checks…" : "Restoring review inputs…",
+      );
+    }
+
+    // --- Coder ---
+    if (action === "coder") {
+      updateState(coderStage, "coder", { iteration });
+      progress.startStep(
+        iteration === 1
+          ? `Implementation ${iteration}/${config.loop.maxIterations}`
+          : `Fixing review feedback ${iteration}/${config.loop.maxIterations}`,
+        "Starting coder sub-agent…",
+        config.models.coder,
+      );
+      const previousFeedback = lastReview
+        ? lastReview.findings.map((f) => `[${f.severity}] ${f.issue} → ${f.expectedFix}`).join("\n")
+        : "";
+      const checkOutputText = lastChecks.length > 0 ? summarizeCheckGroups(lastChecks) : "";
+      const recoveryNote = resume && iteration === firstIteration
+        ? `This run was interrupted during ${resume.state.stage}. Existing workspace changes may be partial.`
+        : undefined;
+      const coderPrompt = buildCoderPrompt(
+        userPrompt, plan, iteration, previousFeedback, checkOutputText, recoveryNote,
+      );
+      coderResult = await runCoder(coderPrompt, config, ctx, signal, progress);
+      lastCoderCompliance = coderResult.compliance;
+      if (runDir) {
+        const iterDir = getIterationAttemptDir(runDir, iteration, state.attempt);
+        saveCoderPrompt(iterDir, coderPrompt);
+        saveCoderArtifacts(iterDir, coderResult.rawResponse, coderResult.compliance ?? {
+          summary: "(none)", filesChanged: [], planItemsCompleted: [], planItemsSkipped: [],
+          reviewerItemsAddressed: [], commandsRun: [], knownIssues: coderResult.errors ?? [],
+        });
+        saveTranscript(runDir, path.join(iterDir, "coder-transcript.json"), coderResult.transcript, config.artifacts.keepTranscripts);
+      }
+      if (signal?.aborted) {
+        return finishInterrupted("Workflow cancelled", "cancelled", iteration, lastModifiedFiles, lastChecks, lastReview, lastDiffStat);
+      }
+      if (coderResult.interrupted) {
+        return finishInterrupted(coderResult.errors?.join(", ") ?? "Coder agent was interrupted", "agent", iteration, lastModifiedFiles, lastChecks, lastReview, lastDiffStat);
+      }
+      action = "checks";
+      await checkpoint("runningChecks", "checks", { iteration });
     }
 
     // --- Collect Git Diff (§8) ---
@@ -259,41 +295,32 @@ export async function runConductWorkflow(
     lastModifiedFiles = modifiedFiles;
 
     if (runDir && config.artifacts.keepDiffs) {
-      const iterDir = getIterationDir(runDir, iteration);
+      const iterDir = getIterationAttemptDir(runDir, iteration, state.attempt);
       saveGitDiff(iterDir, diff.diff, diff.stat);
     }
 
     if (signal?.aborted) {
-      return finishCancelled(iteration, modifiedFiles, lastChecks, lastReview, diff.stat);
+      return finishInterrupted("Workflow cancelled", "cancelled", iteration, modifiedFiles, lastChecks, lastReview, diff.stat);
     }
 
     // --- Running Checks (§9) ---
-    updateState("runningChecks");
-    progress.setActivity("Running configured checks…");
-
-    const checks = await runConfiguredChecks(
-      {
-        format: config.commands.format,
-        lint: config.commands.lint,
-        test: config.commands.test,
-      },
-      exec,
-      signal,
-    );
-    lastChecks = checks;
-
+    let checks = lastChecks;
+    if (action !== "reviewer") {
+      progress.setActivity("Running configured checks…");
+      checks = await runConfiguredChecks(
+        { format: config.commands.format, lint: config.commands.lint, test: config.commands.test },
+        exec,
+        signal,
+      );
+      lastChecks = checks;
+      if (runDir) saveCheckResults(getIterationAttemptDir(runDir, iteration, state.attempt), checks);
+      if (signal?.aborted) {
+        return finishInterrupted("Workflow cancelled", "cancelled", iteration, modifiedFiles, checks, lastReview, diff.stat);
+      }
+      action = "reviewer";
+    }
     const checksPass = evaluateRequiredChecks(checks, config.loop.requirePassingChecks);
-    updateState("runningChecks", { checksPass });
-
-    if (runDir) {
-      const iterDir = getIterationDir(runDir, iteration);
-      saveCheckResults(iterDir, checks);
-    }
-
-    if (signal?.aborted) {
-      return finishCancelled(iteration, modifiedFiles, checks, lastReview, diff.stat);
-    }
-
+    await checkpoint("reviewing", "reviewer", { iteration, checksPass });
     progress.completeStep();
 
     // §16.4: if checks fail and continueAfterCheckFailure is false, stop now.
@@ -307,7 +334,7 @@ export async function runConductWorkflow(
         { stat: diff.stat, modifiedFiles },
         artifactPath,
       );
-      updateState("failed", { error: reason });
+      setStatus("failed", reason);
       if (runDir) saveFinalSummary(runDir, summary);
       notify(ctx, "Conduct stopped: checks failed", "warning");
       progress.finish();
@@ -323,7 +350,7 @@ export async function runConductWorkflow(
     }
 
     // --- Reviewing (§12) ---
-    updateState("reviewing");
+    updateState("reviewing", "reviewer", { iteration });
     progress.startStep(
       `Review ${iteration}/${config.loop.maxIterations}`,
       "Starting reviewer sub-agent…",
@@ -347,6 +374,10 @@ export async function runConductWorkflow(
       );
     }
 
+    const savedCheckArtifact = checks
+      .flatMap((group) => group.results)
+      .find((result) => result.artifactPath)?.artifactPath;
+
     const reviewerPrompt = buildReviewerPrompt(
       userPrompt,
       plan,
@@ -364,7 +395,11 @@ export async function runConductWorkflow(
       checks.flatMap((g) => g.results),
       reviewHistory,
       reviewerNotes.length > 0 ? reviewerNotes.join("\n\n") : undefined,
-      runDir ? path.join(getIterationDir(runDir, iteration), "checks") : undefined,
+      savedCheckArtifact
+        ? path.dirname(savedCheckArtifact)
+        : runDir
+          ? path.join(getIterationAttemptDir(runDir, iteration, state.attempt), "checks")
+          : undefined,
     );
 
     const reviewerResult: ReviewerResult = await runReviewer(
@@ -376,7 +411,7 @@ export async function runConductWorkflow(
     );
 
     if (runDir) {
-      const iterDir = getIterationDir(runDir, iteration);
+      const iterDir = getIterationAttemptDir(runDir, iteration, state.attempt);
       saveReviewerPrompt(iterDir, reviewerPrompt);
       saveReviewerArtifacts(iterDir, reviewerResult.rawResponse, reviewerResult.review);
       saveTranscript(
@@ -388,7 +423,10 @@ export async function runConductWorkflow(
     }
 
     if (signal?.aborted) {
-      return finishCancelled(iteration, modifiedFiles, checks, lastReview, diff.stat);
+      return finishInterrupted("Workflow cancelled", "cancelled", iteration, modifiedFiles, checks, lastReview, diff.stat);
+    }
+    if (reviewerResult.interrupted) {
+      return finishInterrupted(reviewerResult.errors?.join(", ") ?? "Reviewer agent was interrupted", "agent", iteration, modifiedFiles, checks, lastReview, diff.stat);
     }
 
     reviewHistory.push(reviewerResult.review);
@@ -396,7 +434,7 @@ export async function runConductWorkflow(
     progress.completeStep();
 
     const counts = countFindings(reviewerResult.review);
-    updateState("reviewing", {
+    updateState("reviewing", "reviewer", {
       reviewStatus: reviewerResult.review.status,
       reviewFindingCount: counts,
     });
@@ -421,7 +459,7 @@ export async function runConductWorkflow(
         reviewerResult.review,
         artifactPath,
       );
-      updateState("completed");
+      setStatus("completed");
       if (runDir) saveFinalSummary(runDir, summary);
       notify(ctx, "Conduct completed successfully", "info");
       progress.finish();
@@ -448,7 +486,7 @@ export async function runConductWorkflow(
         { stat: diff.stat, modifiedFiles },
         artifactPath,
       );
-      updateState("needsUserIntervention", { error: reason });
+      setStatus("needsUserIntervention", reason);
       if (runDir) saveFinalSummary(runDir, summary);
       notify(ctx, `Conduct blocked: ${reviewerResult.review.summary}`, "warning");
       progress.finish();
@@ -480,7 +518,7 @@ export async function runConductWorkflow(
         { stat: diff.stat, modifiedFiles },
         artifactPath,
       );
-      updateState("completed", { error: reason });
+      setStatus("completed", reason);
       if (runDir) saveFinalSummary(runDir, summary);
       notify(ctx, "Conduct stopped: only minor findings remain", "warning");
       progress.finish();
@@ -508,7 +546,7 @@ export async function runConductWorkflow(
         { stat: diff.stat, modifiedFiles },
         artifactPath,
       );
-      updateState("failed", { error: reason });
+      setStatus("failed", reason);
       if (runDir) saveFinalSummary(runDir, summary);
       notify(
         ctx,
@@ -529,11 +567,15 @@ export async function runConductWorkflow(
     }
 
     // --- Continue to next iteration ---
+    lastChecks = checks;
+    await checkpoint("fixing", "coder", { iteration: iteration + 1 });
   }
 
   // Loop exited without a verdict (e.g. aborted).
   if (signal?.aborted) {
-    return finishCancelled(
+    return finishInterrupted(
+      "Workflow cancelled",
+      "cancelled",
       state.iteration,
       lastModifiedFiles,
       lastChecks,
@@ -551,7 +593,7 @@ export async function runConductWorkflow(
     { stat: lastDiffStat, modifiedFiles: lastModifiedFiles },
     artifactPath,
   );
-  updateState("failed", { error: reason });
+  setStatus("failed", reason);
   if (runDir) saveFinalSummary(runDir, summary);
   progress.finish();
   return {

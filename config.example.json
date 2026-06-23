@@ -37,5 +37,8 @@
     "root": ".pi/conduct/runs",
     "keepTranscripts": true,
     "keepDiffs": true
+  },
+  "keybindings": {
+    "liveOutput": ["f12"]
   }
 }

@@ -185,6 +185,7 @@ export interface PlannerResult {
   valid: boolean;
   errors?: string[];
   transcript: string;
+  interrupted?: boolean;
 }
 
 export async function runPlanner(
@@ -210,6 +211,7 @@ export async function runPlanner(
         valid: false,
         errors: [`Planner agent error: ${errorMessage}`],
         transcript: serializeTranscript(session.agent.state.messages),
+        interrupted: true,
       };
     }
 
@@ -255,6 +257,7 @@ export interface CoderResult {
   valid: boolean;
   errors?: string[];
   transcript: string;
+  interrupted?: boolean;
 }
 
 const FALLBACK_COMPLIANCE: CoderCompliance = {
@@ -290,6 +293,7 @@ export async function runCoder(
         valid: false,
         errors: [`Coder agent error: ${errorMessage}`],
         transcript: serializeTranscript(session.agent.state.messages),
+        interrupted: true,
       };
     }
 
@@ -346,6 +350,7 @@ export interface ReviewerResult {
   valid: boolean;
   errors?: string[];
   transcript: string;
+  interrupted?: boolean;
 }
 
 export async function runReviewer(
@@ -377,6 +382,7 @@ export async function runReviewer(
         valid: false,
         errors: [`Reviewer agent error: ${errorMessage}`],
         transcript: serializeTranscript(session.agent.state.messages),
+        interrupted: true,
       };
     }
 

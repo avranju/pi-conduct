@@ -65,6 +65,7 @@ export function buildCoderPrompt(
   iteration: number,
   previousReviewerFeedback: string,
   checkOutput: string,
+  recoveryNote?: string,
 ): string {
   const parts: string[] = [
     `You are the coder agent for Pi Conduct.`,
@@ -83,6 +84,16 @@ export function buildCoderPrompt(
     ``,
     `Current iteration: ${iteration}`,
   ];
+
+  if (recoveryNote) {
+    parts.push(
+      `Recovery context:`,
+      `---`,
+      recoveryNote,
+      `---`,
+      `Inspect the current working tree before editing. Preserve correct partial work and complete or repair it; do not assume the workspace is clean.`,
+    );
+  }
 
   if (previousReviewerFeedback) {
     parts.push(

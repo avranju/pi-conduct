@@ -353,6 +353,15 @@ export interface ArtifactConfig {
   keepDiffs: boolean;
 }
 
+// --- Keybinding Config ---
+
+export interface KeybindingConfig {
+  /** Key(s) that open or close the live sub-agent output view. */
+  liveOutput: string[];
+}
+
+export const DEFAULT_LIVE_OUTPUT_KEYBINDING = process.platform === "darwin" ? "f12" : "ctrl+alt+d";
+
 // --- Extension Config ---
 
 export interface ConductConfig {
@@ -369,6 +378,7 @@ export interface ConductConfig {
     test: string[];
   };
   artifacts: ArtifactConfig;
+  keybindings: KeybindingConfig;
 }
 
 // --- Default Config ---
@@ -413,39 +423,59 @@ export const DEFAULT_CONFIG: ConductConfig = {
     keepTranscripts: true,
     keepDiffs: true,
   },
+  keybindings: {
+    liveOutput: [DEFAULT_LIVE_OUTPUT_KEYBINDING],
+  },
 };
 
 // --- Run State Machine (§6) ---
 
 export type RunStage =
-  | "idle"
   | "planning"
   | "validatingPlan"
   | "implementing"
   | "runningChecks"
   | "reviewing"
-  | "fixing"
+  | "fixing";
+
+export type RunStatus =
+  | "running"
+  | "interrupted"
   | "completed"
   | "failed"
   | "needsUserIntervention";
 
+export type ResumeAction = "planning" | "coder" | "checks" | "reviewer";
+
 export interface RunState {
+  version: 1;
+  status: RunStatus;
   stage: RunStage;
+  resumeAction: ResumeAction;
   iteration: number;
   maxIterations: number;
+  attempt: number;
   planValid: boolean;
   checksPass: boolean;
   reviewStatus: ReviewStatus | null;
   reviewFindingCount: { blocking: number; important: number; minor: number };
+  repoRoot?: string;
+  baseHead?: string;
+  workspaceFingerprint?: string;
+  interruptionKind?: "cancelled" | "agent" | "unexpected";
   error?: string;
   updatedAt: string;
 }
 
 export function emptyRunState(maxIterations: number): RunState {
   return {
-    stage: "idle",
+    version: 1,
+    status: "running",
+    stage: "planning",
+    resumeAction: "planning",
     iteration: 0,
     maxIterations,
+    attempt: 1,
     planValid: false,
     checksPass: false,
     reviewStatus: null,

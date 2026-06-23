@@ -61,6 +61,12 @@ Example:
 /conduct Add a new REST endpoint for user registration with email validation
 ```
 
+Resume an interrupted run with its artifact-directory name:
+
+```
+/conduct resume 2026-06-23-143012-add-rest-endpoint
+```
+
 Because Pi does not normally render extension slash commands in the chat, the
 task text is persisted and rendered as a normal user message before Conduct
 starts showing progress. It remains available when scrolling back or reopening
@@ -73,15 +79,21 @@ the major-step row includes elapsed time, and completed rows retain their final
 duration and remain visible with a green checkmark. Each agent-backed row also
 shows its provider, model, and configured thinking level in subdued styling.
 
-Press `Ctrl+Alt+D` to open the active sub-agent's live output. The detail view
+Press the configured live-output keybinding to open the active sub-agent's live
+output. The default is `F12` on macOS and `Ctrl+Alt+D` elsewhere. The detail view
 continues updating while the agent works; use the arrow or page keys to scroll,
-`End` to follow the latest output, and `Esc` to close it.
+`End` to follow the latest output, and `Esc` or the live-output keybinding to
+close it.
 
 Outside the detail view, press `Esc` to request cancellation of the complete
 Conduct workflow. Confirm the prompt to cancel; declining or dismissing it
 leaves the workflow running. Confirmed cancellation propagates to the active
 planner/coder/reviewer session and to any configured check command that is
 currently running. File changes already made are retained.
+Cancelled runs and runs interrupted by provider, quota, billing, authentication,
+or unexpected runtime errors retain a resumable checkpoint. Conduct restarts
+the interrupted stage from persisted structured artifacts; it does not attempt
+to continue a partial token stream or tool call.
 
 When the workflow ends, Conduct copies the final progress rows into the final
 chat summary and removes the live widget. Subsequent Pi messages therefore
@@ -94,6 +106,11 @@ overriding matching global settings:
 
 - `~/.pi/agent/conduct/config.json`
 - `<repo>/.pi/conduct/config.json`
+
+`keybindings.liveOutput` may be a single key string or an array of key strings.
+If you change it while pi is already running, run `/reload` to refresh the
+registered global shortcut. Active Conduct runs also listen for the configured
+shortcut from the run's resolved config.
 
 ### Example Config
 
@@ -137,6 +154,9 @@ overriding matching global settings:
     "root": ".pi/conduct/runs",
     "keepTranscripts": true,
     "keepDiffs": true
+  },
+  "keybindings": {
+    "liveOutput": ["f12"]
   }
 }
 ```
@@ -166,6 +186,7 @@ overriding matching global settings:
 | `commands.lint` | Lint check commands | `[]` |
 | `commands.test` | Test check commands | `[]` |
 | `artifacts.root` | Root directory for run artifacts | `.pi/conduct/runs` |
+| `keybindings.liveOutput` | Key(s) to open/close live sub-agent output | macOS: `["f12"]`; other platforms: `["ctrl+alt+d"]` |
 
 ## Architecture
 
@@ -229,13 +250,20 @@ Every `/conduct` run gets a unique run directory:
     review-response.md
     review.json
     reviewer-transcript.json
+    attempt-2/
+      ... artifacts produced by a resumed attempt ...
   iteration-2/
     ...
   final-summary.md
 ```
 
-`state.json` persists the workflow state machine (§6) at every stage
-transition so a run can be inspected without trusting model prose.
+`state.json` persists workflow status separately from the active work stage,
+the next resumable action, attempt number, repository identity, and a workspace
+fingerprint. JSON checkpoints are written with an atomic replace. Resume is
+rejected if the repository or working tree changed after interruption, and a
+per-run lock prevents concurrent execution. Completed artifacts are reused;
+an interrupted coder is restarted with explicit recovery context so it inspects
+and reconciles any partial file changes already present.
 
 ## Safety Policy
 
@@ -257,8 +285,13 @@ containers.
 ## State Machine
 
 ```
-Idle -> Planning
-  -> ValidatingPlan -> Implementing -> RunningChecks -> Reviewing
-  -> (loop: Fixing -> RunningChecks -> Reviewing)
-  -> Completed / Failed / NeedsUserIntervention
+status=running:
+  Planning -> ValidatingPlan -> Implementing -> RunningChecks -> Reviewing
+    -> (loop: Fixing -> RunningChecks -> Reviewing)
+
+terminal status:
+  Completed / Failed / NeedsUserIntervention
+
+resumable status:
+  Interrupted (retains the active stage and next action)
 ```

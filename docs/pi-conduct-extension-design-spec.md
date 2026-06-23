@@ -167,6 +167,9 @@ If no config exists, use safe defaults and tell the user which defaults are bein
     "root": ".pi/conduct/runs",
     "keepTranscripts": true,
     "keepDiffs": true
+  },
+  "keybindings": {
+    "liveOutput": ["f12"]
   }
 }
 ```
@@ -181,6 +184,7 @@ Reject or warn on:
 2. `maxIterations < 1`.
 3. Empty test/lint/format commands when `requirePassingChecks` is true.
 4. Invalid artifact root.
+5. Empty or malformed `keybindings.liveOutput`.
 
 ---
 
@@ -221,11 +225,11 @@ The reviewer should generally not edit files. The supervisor, not the reviewer, 
 
 ## 6. Workflow State Machine
 
-Use an explicit state machine.
+Track terminal/resumable status separately from the active work stage.
 
 ```text
-Idle
-  -> Planning
+status=running
+  Planning
   -> ValidatingPlan
   -> Implementing
   -> RunningChecks
@@ -233,10 +237,16 @@ Idle
   -> Fixing
   -> RunningChecks
   -> Reviewing
-  -> Completed
-  -> Failed
-  -> NeedsUserIntervention
+
+status=completed | failed | needsUserIntervention
+status=interrupted (retains stage plus resumeAction)
 ```
+
+`resumeAction` is one of `planning`, `coder`, `checks`, or `reviewer`. Persist it
+after the inputs for that action are durable. Cancellation and provider,
+quota, billing, authentication, or unexpected runtime failures set
+`status=interrupted`; malformed structured output and workflow stop conditions
+remain terminal failures.
 
 ### 6.1 Stop Conditions
 
@@ -252,7 +262,7 @@ Stop unsuccessfully when:
 
 ```text
 iteration >= maxIterations
-OR unrecoverable config/model/tool error occurs
+OR unrecoverable configuration or workflow error occurs
 OR planner output cannot be parsed after retries
 OR coder cannot make progress
 OR reviewer returns blocked
@@ -304,6 +314,8 @@ iteration-1/
   review-prompt.md
   review-response.md
   review.json
+  attempt-2/
+    ... artifacts produced by a resumed attempt ...
 iteration-2/
   coder-prompt.md
   coder-response.md
@@ -320,7 +332,11 @@ iteration-2/
 final-summary.md
 ```
 
-Persist enough information that a user can inspect what happened without trusting model prose.
+Persist enough information that a user can inspect what happened without
+trusting model prose. State writes use an atomic replace. Resumption verifies
+the repository identity, HEAD, tracked diff, and changed/untracked file content
+against the saved workspace fingerprint, and a per-run lock prevents concurrent
+execution.
 
 ---
 
@@ -761,7 +777,7 @@ Compact example:
 ✓ Review 1/5 · (openai) gpt-5.5 / high · 1m 6s
 ● Fixing review feedback 2/5 · (ollama) qwen3.5-coder-32b / off · 28s
   Running cargo test
-  Ctrl+Alt+D: live sub-agent output
+  F12: live sub-agent output
 ```
 
 The active major step is bold and uses the theme accent colour. Its activity
@@ -779,8 +795,9 @@ Show elapsed time on the major-step row and refresh it once per second. Activity
 label changes must not reset the timer. When the step finishes, retain its final
 duration beside the completed row.
 
-`Ctrl+Alt+D` opens a scrollable overlay containing the active role session's
-full streamed reasoning/text and tool output. The overlay updates in real time,
+The configured live-output keybinding opens a scrollable overlay containing the
+active role session's full streamed reasoning/text and tool output. The default
+is `F12` on macOS and `Ctrl+Alt+D` elsewhere. The overlay updates in real time,
 follows the tail by default, and can be closed without interrupting the
 workflow. Throttle overlay redraws so provider token cadence does not become
 TUI render cadence.
@@ -966,7 +983,8 @@ Artifacts:
 
 - Better status messages.
 - Final summary.
-- Resume/cancel/status subcommands.
+- Resume support with stage-boundary checkpoints and workspace verification.
+- Cancel/status subcommands.
 
 ---
 

@@ -1,6 +1,7 @@
 import type { ExecOptions, ExecResult } from "@earendil-works/pi-coding-agent";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { createHash } from "node:crypto";
 
 // ============================================================================
 // Git Utilities (§8)
@@ -110,6 +111,43 @@ export async function getGitRoot(exec: Exec): Promise<string | null> {
   } catch {
     return null;
   }
+}
+
+export async function getGitHead(exec: Exec): Promise<string> {
+  try {
+    const result = await exec("git", ["rev-parse", "HEAD"], { timeout: 5_000 });
+    return result.code === 0 ? result.stdout.trim() : "";
+  } catch {
+    return "";
+  }
+}
+
+export async function fingerprintWorkspace(
+  exec: Exec,
+  excludePaths: string[] = [],
+): Promise<string> {
+  const root = await getGitRoot(exec);
+  if (!root) throw new Error("Cannot fingerprint a non-git workspace");
+  const [head, diff, files] = await Promise.all([
+    getGitHead(exec),
+    collectGitDiff(exec, excludePaths),
+    collectModifiedFiles(exec, excludePaths),
+  ]);
+  const hash = createHash("sha256");
+  hash.update(`HEAD\0${head}\0DIFF\0${diff.diff}\0`);
+  for (const file of files) {
+    hash.update(`PATH\0${file}\0`);
+    const fullPath = path.join(root, file);
+    try {
+      const stat = fs.lstatSync(fullPath);
+      if (stat.isSymbolicLink()) hash.update(`LINK\0${fs.readlinkSync(fullPath)}\0`);
+      else if (stat.isFile()) hash.update(fs.readFileSync(fullPath));
+      else hash.update(`TYPE\0${stat.mode}\0`);
+    } catch {
+      hash.update("MISSING\0");
+    }
+  }
+  return hash.digest("hex");
 }
 
 function splitLines(text: string): string[] {

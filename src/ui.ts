@@ -8,11 +8,13 @@ import {
   type Component,
   type Focusable,
   type TUI,
+  type KeyId,
   matchesKey,
   truncateToWidth,
   visibleWidth,
   wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
+import { formatKeybindings, matchesAnyKey } from "./keybindings.js";
 
 const WIDGET_KEY = "conduct-progress";
 const DETAIL_RENDER_INTERVAL_MS = 80;
@@ -54,7 +56,10 @@ export class ConductProgress {
   private detailRenderTimer?: ReturnType<typeof setTimeout>;
   private activityTimer?: ReturnType<typeof setInterval>;
 
-  constructor(private readonly ctx: ExtensionCommandContext) {}
+  constructor(
+    private readonly ctx: ExtensionCommandContext,
+    private readonly liveOutputKeybindings: KeyId[],
+  ) {}
 
   startStep(
     title: string,
@@ -233,6 +238,7 @@ export class ConductProgress {
             () => this.detailTitle,
             () => this.detailEntries.map((entry) => entry.text).join(""),
             () => done(),
+            this.liveOutputKeybindings,
           );
           this.detailViewer = viewer;
           return viewer;
@@ -291,7 +297,9 @@ export class ConductProgress {
     }
 
     if (this.currentStep()?.state === "active") {
-      lines.push(theme.fg("dim", "  Ctrl+Alt+D: live sub-agent output"));
+      lines.push(
+        theme.fg("dim", `  ${formatKeybindings(this.liveOutputKeybindings)}: live sub-agent output`),
+      );
     }
 
     this.ctx.ui.setWidget(WIDGET_KEY, lines);
@@ -375,10 +383,11 @@ class LiveOutputViewer implements Component, Focusable {
     private readonly getTitle: () => string,
     private readonly getOutput: () => string,
     private readonly done: () => void,
+    private readonly closeKeybindings: KeyId[],
   ) {}
 
   handleInput(data: string): void {
-    if (matchesKey(data, "escape") || matchesKey(data, "ctrl+alt+d")) {
+    if (matchesKey(data, "escape") || matchesAnyKey(data, this.closeKeybindings)) {
       this.close();
       return;
     }
@@ -412,7 +421,12 @@ class LiveOutputViewer implements Component, Focusable {
     return [
       border(`╭${"─".repeat(innerWidth + 2)}╮`),
       row(this.theme.bold(this.theme.fg("accent", this.getTitle()))),
-      row(this.theme.fg("dim", "Live output • ↑↓/PgUp/PgDn scroll • End follow • Esc close")),
+      row(
+        this.theme.fg(
+          "dim",
+          `Live output • ↑↓/PgUp/PgDn scroll • End follow • Esc/${formatKeybindings(this.closeKeybindings)} close`,
+        ),
+      ),
       border(`├${"─".repeat(innerWidth + 2)}┤`),
       ...visible.map(row),
       border(`╰${"─".repeat(innerWidth + 2)}╯`),
