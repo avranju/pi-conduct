@@ -40,6 +40,10 @@ import { createSafeBashTool } from "./safe-bash.js";
 import { buildPlannerRepairPrompt, buildReviewerRepairPrompt } from "./prompts.js";
 import { parseJson } from "./utils.js";
 
+export interface AgentProgressObserver {
+  observeAgent(session: AgentSession): () => void;
+}
+
 // --- Role tool sets (§5) ---
 
 const PLANNER_TOOLS = ["read", "grep", "find", "ls", "bash"];
@@ -55,7 +59,8 @@ const MAX_JSON_RETRIES = 2;
 /**
  * Create an isolated AgentSession for a role.
  *
- * - Uses an in-memory session manager (throwaway, not persisted to disk).
+ * - Uses a persistent session manager so role sessions are recorded in Pi's
+ *   global session store.
  * - Loads NO host extensions/skills/prompts/themes, so sub-agents cannot
  *   recurse into /conduct or pick up unrelated tools. Project context files
  *   (AGENTS.md) are still loaded so agents follow repo conventions.
@@ -104,7 +109,7 @@ async function createRoleSession(
     tools,
     customTools: [safeBash],
     resourceLoader: loader,
-    sessionManager: SessionManager.inMemory(ctx.cwd),
+    sessionManager: SessionManager.create(ctx.cwd),
     settingsManager,
   });
 
@@ -187,9 +192,11 @@ export async function runPlanner(
   config: ConductConfig,
   ctx: ExtensionCommandContext,
   signal: AbortSignal | undefined,
+  progress?: AgentProgressObserver,
 ): Promise<PlannerResult> {
   const session = await createRoleSession(ctx, config.models.planner, PLANNER_TOOLS, config.safety);
   const cleanup = wireAbort(session, signal);
+  const stopObserving = progress?.observeAgent(session) ?? (() => {});
 
   try {
     await session.prompt(prompt);
@@ -211,7 +218,11 @@ export async function runPlanner(
       ? validateImplementationPlan(parsed)
       : { valid: false, errors: ["Could not parse JSON from planner response"] };
 
-    for (let attempt = 0; attempt < MAX_JSON_RETRIES && !validation.valid; attempt++) {
+    for (
+      let attempt = 0;
+      attempt < MAX_JSON_RETRIES && !validation.valid && !signal?.aborted;
+      attempt++
+    ) {
       await session.prompt(buildPlannerRepairPrompt(validation.errors));
       text = lastAssistantText(session.agent.state.messages);
       parsed = parseJson<ImplementationPlan>(text);
@@ -228,6 +239,7 @@ export async function runPlanner(
       transcript: serializeTranscript(session.agent.state.messages),
     };
   } finally {
+    stopObserving();
     cleanup();
     session.dispose();
   }
@@ -260,9 +272,11 @@ export async function runCoder(
   config: ConductConfig,
   ctx: ExtensionCommandContext,
   signal: AbortSignal | undefined,
+  progress?: AgentProgressObserver,
 ): Promise<CoderResult> {
   const session = await createRoleSession(ctx, config.models.coder, CODER_TOOLS, config.safety);
   const cleanup = wireAbort(session, signal);
+  const stopObserving = progress?.observeAgent(session) ?? (() => {});
 
   try {
     await session.prompt(prompt);
@@ -284,7 +298,11 @@ export async function runCoder(
       ? validateCoderCompliance(parsed)
       : { valid: false, errors: ["Could not parse JSON from coder response"] };
 
-    for (let attempt = 0; attempt < MAX_JSON_RETRIES && !validation.valid; attempt++) {
+    for (
+      let attempt = 0;
+      attempt < MAX_JSON_RETRIES && !validation.valid && !signal?.aborted;
+      attempt++
+    ) {
       await session.prompt(
         `Your previous response did not contain valid CoderCompliance JSON.\nErrors:\n${validation.errors.join("\n")}\n\nReturn only the corrected JSON in a markdown code block with the language "json".`,
       );
@@ -312,6 +330,7 @@ export async function runCoder(
       transcript: serializeTranscript(session.agent.state.messages),
     };
   } finally {
+    stopObserving();
     cleanup();
     session.dispose();
   }
@@ -334,9 +353,11 @@ export async function runReviewer(
   config: ConductConfig,
   ctx: ExtensionCommandContext,
   signal: AbortSignal | undefined,
+  progress?: AgentProgressObserver,
 ): Promise<ReviewerResult> {
   const session = await createRoleSession(ctx, config.models.reviewer, REVIEWER_TOOLS, config.safety);
   const cleanup = wireAbort(session, signal);
+  const stopObserving = progress?.observeAgent(session) ?? (() => {});
 
   try {
     await session.prompt(prompt);
@@ -364,7 +385,11 @@ export async function runReviewer(
       ? validateReviewResult(parsed)
       : { valid: false, errors: ["Could not parse JSON from reviewer response"] };
 
-    for (let attempt = 0; attempt < MAX_JSON_RETRIES && !validation.valid; attempt++) {
+    for (
+      let attempt = 0;
+      attempt < MAX_JSON_RETRIES && !validation.valid && !signal?.aborted;
+      attempt++
+    ) {
       await session.prompt(buildReviewerRepairPrompt(validation.errors));
       text = lastAssistantText(session.agent.state.messages);
       parsed = parseJson<ReviewResult>(text);
@@ -397,6 +422,7 @@ export async function runReviewer(
       transcript: serializeTranscript(session.agent.state.messages),
     };
   } finally {
+    stopObserving();
     cleanup();
     session.dispose();
   }

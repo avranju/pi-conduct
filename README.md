@@ -61,6 +61,32 @@ Example:
 /conduct Add a new REST endpoint for user registration with email validation
 ```
 
+Because Pi does not normally render extension slash commands in the chat, the
+task text is persisted and rendered as a normal user message before Conduct
+starts showing progress. It remains available when scrolling back or reopening
+the session and does not trigger a separate parent-agent turn.
+
+While a run is active, Conduct shows a fixed progress widget above the editor.
+Planning and every implementation/review iteration have their own row. The
+active row is highlighted and has a live, subdued activity label underneath;
+the major-step row includes elapsed time, and completed rows retain their final
+duration and remain visible with a green checkmark. Each agent-backed row also
+shows its provider, model, and configured thinking level in subdued styling.
+
+Press `Ctrl+Alt+D` to open the active sub-agent's live output. The detail view
+continues updating while the agent works; use the arrow or page keys to scroll,
+`End` to follow the latest output, and `Esc` to close it.
+
+Outside the detail view, press `Esc` to request cancellation of the complete
+Conduct workflow. Confirm the prompt to cancel; declining or dismissing it
+leaves the workflow running. Confirmed cancellation propagates to the active
+planner/coder/reviewer session and to any configured check command that is
+currently running. File changes already made are retained.
+
+When the workflow ends, Conduct copies the final progress rows into the final
+chat summary and removes the live widget. Subsequent Pi messages therefore
+render beneath the summary instead of accumulating above fixed progress rows.
+
 ## Configuration
 
 Configuration is loaded from these locations, with the repository configuration
@@ -156,7 +182,7 @@ src/
   git.ts          - Git utility functions
   checks.ts       - Check execution (format, lint, test)
   artifacts.ts    - Artifact storage and run-state persistence
-  ui.ts           - Progress UI helpers
+  ui.ts           - Persistent progress widget and live-output viewer
   utils.ts        - Utility functions (JSON extraction, safety patterns)
 ```
 

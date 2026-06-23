@@ -658,17 +658,22 @@ async function runConductWorkflow(userPrompt: string, ctx: ExtensionContext) {
   const config = await loadAndValidateConfig(ctx.cwd);
   const run = await createRunArtifacts(config, userPrompt);
 
-  await ui.status(ctx, "Conduct: planning");
+  progress.startStep("Planning", "Starting planner sub-agent…", config.models.planner);
   const planRaw = await runPlanner(userPrompt, config, ctx, run);
   const plan = await parseAndValidatePlan(planRaw);
   await savePlan(run, planRaw, plan);
+  progress.completeStep();
 
   let reviewHistory = [];
   let lastReview = null;
   let lastChecks = null;
 
   for (let iteration = 1; iteration <= config.loop.maxIterations; iteration++) {
-    await ui.status(ctx, `Conduct: implementing iteration ${iteration}`);
+    progress.startStep(
+      `Implementation ${iteration}/${config.loop.maxIterations}`,
+      "Starting coder sub-agent…",
+      config.models.coder
+    );
     const coderResult = await runCoder({
       userPrompt,
       plan,
@@ -680,13 +685,18 @@ async function runConductWorkflow(userPrompt: string, ctx: ExtensionContext) {
       run
     });
 
-    await ui.status(ctx, `Conduct: running checks iteration ${iteration}`);
+    progress.setActivity("Running configured checks…");
     const diff = await collectGitDiff();
     const checks = await runConfiguredChecks(config);
     lastChecks = checks;
     await saveIterationArtifacts(run, iteration, coderResult, diff, checks);
 
-    await ui.status(ctx, `Conduct: reviewing iteration ${iteration}`);
+    progress.completeStep();
+    progress.startStep(
+      `Review ${iteration}/${config.loop.maxIterations}`,
+      "Starting reviewer sub-agent…",
+      config.models.reviewer
+    );
     const review = await runReviewer({
       userPrompt,
       plan,
@@ -702,6 +712,7 @@ async function runConductWorkflow(userPrompt: string, ctx: ExtensionContext) {
     reviewHistory.push(review);
     lastReview = review;
     await saveReview(run, iteration, review);
+    progress.completeStep();
 
     const requiredChecksPass = evaluateRequiredChecks(config, checks);
     const hasBlockingFindings = review.findings.some(f => f.severity === "blocking");
@@ -732,23 +743,61 @@ async function runConductWorkflow(userPrompt: string, ctx: ExtensionContext) {
 
 ## 14. Progress UX
 
-Use stage-level progress, not token-level noise.
+Before showing workflow progress, persist the `/conduct` argument as a visible,
+non-triggering custom session message rendered with Pi's native user-message
+component. This compensates for extension slash commands not appearing in chat,
+keeps the original task scrollable and restorable, and avoids starting an
+unrelated parent-agent turn.
 
-Examples:
+Render one keyed widget above the editor and replace its contents in place.
+This gives continuous feedback without adding a stream of notifications to the
+conversation or causing the terminal to scroll.
+
+Compact example:
 
 ```text
-Conduct: planning with openai/gpt-5.5
-Conduct: plan created, 5 files to modify, 2 files to create
-Conduct: implementing with ollama/qwen3.5-coder-32b
-Conduct: running checks
-Conduct: tests failed, sending diff and output to reviewer
-Conduct: reviewer found 2 blocking issues and 1 important issue
-Conduct: fixing iteration 2/5
-Conduct: checks passed
-Conduct: reviewer approved
+✓ Planning · (openai) gpt-5.5 / high · 42s
+✓ Implementation 1/5 · (ollama) qwen3.5-coder-32b / off · 3m 17s
+✓ Review 1/5 · (openai) gpt-5.5 / high · 1m 6s
+● Fixing review feedback 2/5 · (ollama) qwen3.5-coder-32b / off · 28s
+  Running cargo test
+  Ctrl+Alt+D: live sub-agent output
 ```
 
-Use Pi UI facilities such as status/notify/session entries. Avoid custom widgets in MVP.
+The active major step is bold and uses the theme accent colour. Its activity
+label is muted. The provider, model, and thinking level appear on the major-step
+row in muted, non-bold styling. Omit the thinking-level suffix when unavailable.
+Completed steps use a green checkmark and remain in the widget, so the user can
+see overall progress. Planning, each implementation iteration, and each review
+iteration are major steps. Diff collection and configured checks are activity
+labels within the implementation step.
+
+Subscribe to each role `AgentSession` while it runs. Convert thinking, streamed
+text, tool starts/completions, retries, and context compaction into concise
+activity labels. Do not render token deltas in the compact widget.
+Show elapsed time on the major-step row and refresh it once per second. Activity
+label changes must not reset the timer. When the step finishes, retain its final
+duration beside the completed row.
+
+`Ctrl+Alt+D` opens a scrollable overlay containing the active role session's
+full streamed reasoning/text and tool output. The overlay updates in real time,
+follows the tail by default, and can be closed without interrupting the
+workflow. Throttle overlay redraws so provider token cadence does not become
+TUI render cadence.
+
+Outside the detail overlay, `Esc` opens a confirmation dialog for cancelling the
+entire workflow. Only an affirmative response aborts the workflow; declining or
+dismissing the dialog leaves it running. The dialog warns that existing file
+changes remain and is automatically dismissed if the workflow finishes while
+it is open. The command owns an `AbortController`; after confirmation, its
+signal is forwarded to the active role session and to configured check
+processes. The supervisor checks for cancellation between stages and must not
+validate, repair, check, or review after cancellation.
+
+At every terminal outcome, snapshot the progress rows as plain chat content,
+append them to the final summary, and remove the keyed widget. The widget must
+not remain mounted after completion because editor widgets stay below the chat
+container and would cause subsequent responses to render above old progress.
 
 ---
 

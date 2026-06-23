@@ -10,7 +10,7 @@ import type {
 } from "./schemas.js";
 import { emptyRunState } from "./schemas.js";
 import type { RunDirectory } from "./artifacts.js";
-import { status, clearStatus, notify } from "./ui.js";
+import { ConductProgress, notify } from "./ui.js";
 import {
   runPlanner,
   runCoder,
@@ -69,6 +69,7 @@ export async function runConductWorkflow(
   repoContext: string,
   runDir?: RunDirectory,
   signal?: AbortSignal,
+  progress = new ConductProgress(ctx),
 ): Promise<WorkflowResult> {
   const state: RunState = emptyRunState(config.loop.maxIterations);
 
@@ -81,17 +82,56 @@ export async function runConductWorkflow(
 
   const artifactPath = runDir?.root ?? "";
 
+  const finishCancelled = (
+    iterations: number,
+    modifiedFiles: string[] = [],
+    checks: CheckGroup[] = [],
+    review: ReviewResult | null = null,
+    diffStat = "",
+  ): WorkflowResult => {
+    const reason = "Workflow cancelled";
+    const summary = buildFailureSummary(
+      reason,
+      userPrompt,
+      checks,
+      review,
+      { stat: diffStat, modifiedFiles },
+      artifactPath,
+    );
+    updateState("failed", { error: reason });
+    if (runDir) saveFinalSummary(runDir, summary);
+    progress.failStep("Cancelled by user");
+    progress.finish();
+    return {
+      success: false,
+      reason,
+      iterations,
+      modifiedFiles,
+      summary,
+      artifactPath,
+      lastChecks: checks.length > 0 ? checks : undefined,
+      lastReview: review ?? undefined,
+    };
+  };
+
   // --- Planning ---
   updateState("planning");
-  await status(
-    ctx,
-    `Conduct: planning with ${config.models.planner.provider}/${config.models.planner.model}`,
+  progress.startStep(
+    "Planning",
+    "Starting planner sub-agent…",
+    config.models.planner,
   );
 
   const plannerPrompt = buildPlannerPrompt(userPrompt, repoContext);
   if (runDir) savePlannerPrompt(runDir, plannerPrompt);
 
-  const plannerResult: PlannerResult = await runPlanner(plannerPrompt, config, ctx, signal);
+  const plannerResult: PlannerResult = await runPlanner(
+    plannerPrompt,
+    config,
+    ctx,
+    signal,
+    progress,
+  );
 
   if (runDir) {
     savePlanRaw(runDir, plannerResult.rawResponse);
@@ -105,17 +145,19 @@ export async function runConductWorkflow(
     );
   }
 
+  if (signal?.aborted) return finishCancelled(0);
+
   // --- Validating Plan ---
   updateState("validatingPlan", { planValid: plannerResult.valid });
 
   if (!plannerResult.valid || !plannerResult.plan) {
     const reason = `Planner output validation failed: ${plannerResult.errors?.join(", ") ?? "unknown"}`;
     updateState("failed", { error: reason });
-    await status(ctx, "Conduct: plan validation failed");
+    progress.failStep("Plan validation failed");
     notify(ctx, `Plan validation failed: ${plannerResult.errors?.join(", ")}`, "error");
     const summary = buildFailureSummary(reason, userPrompt, [], null, null, artifactPath);
     if (runDir) saveFinalSummary(runDir, summary);
-    await clearStatus(ctx);
+    progress.finish();
     return {
       success: false,
       reason,
@@ -127,10 +169,7 @@ export async function runConductWorkflow(
   }
 
   const plan: ImplementationPlan = plannerResult.plan;
-  await status(
-    ctx,
-    `Conduct: plan created, ${plan.filesToModify.length} files to modify, ${plan.filesToCreate.length} files to create`,
-  );
+  progress.completeStep();
 
   // --- Implementation Loop ---
   let reviewHistory: ReviewResult[] = [];
@@ -145,9 +184,12 @@ export async function runConductWorkflow(
     updateState(iteration === 1 ? "implementing" : "fixing", { iteration });
 
     // --- Coder ---
-    await status(
-      ctx,
-      `Conduct: ${iteration === 1 ? "implementing" : "fixing"} with ${config.models.coder.provider}/${config.models.coder.model} (iteration ${iteration}/${config.loop.maxIterations})`,
+    progress.startStep(
+      iteration === 1
+        ? `Implementation ${iteration}/${config.loop.maxIterations}`
+        : `Fixing review feedback ${iteration}/${config.loop.maxIterations}`,
+      "Starting coder sub-agent…",
+      config.models.coder,
     );
 
     const previousFeedback = lastReview
@@ -165,7 +207,13 @@ export async function runConductWorkflow(
       checkOutputText,
     );
 
-    const coderResult: CoderResult = await runCoder(coderPrompt, config, ctx, signal);
+    const coderResult: CoderResult = await runCoder(
+      coderPrompt,
+      config,
+      ctx,
+      signal,
+      progress,
+    );
     lastCoderCompliance = coderResult.compliance;
 
     if (runDir) {
@@ -192,7 +240,18 @@ export async function runConductWorkflow(
       );
     }
 
+    if (signal?.aborted) {
+      return finishCancelled(
+        iteration,
+        lastModifiedFiles,
+        lastChecks,
+        lastReview,
+        lastDiffStat,
+      );
+    }
+
     // --- Collect Git Diff (§8) ---
+    progress.setActivity("Collecting the implementation diff…");
     const artifactExcludes = runDir ? [runDir.root] : [];
     const diff = await collectGitDiff(exec, artifactExcludes);
     lastDiffStat = diff.stat;
@@ -204,9 +263,13 @@ export async function runConductWorkflow(
       saveGitDiff(iterDir, diff.diff, diff.stat);
     }
 
+    if (signal?.aborted) {
+      return finishCancelled(iteration, modifiedFiles, lastChecks, lastReview, diff.stat);
+    }
+
     // --- Running Checks (§9) ---
     updateState("runningChecks");
-    await status(ctx, "Conduct: running checks");
+    progress.setActivity("Running configured checks…");
 
     const checks = await runConfiguredChecks(
       {
@@ -215,6 +278,7 @@ export async function runConductWorkflow(
         test: config.commands.test,
       },
       exec,
+      signal,
     );
     lastChecks = checks;
 
@@ -226,11 +290,11 @@ export async function runConductWorkflow(
       saveCheckResults(iterDir, checks);
     }
 
-    if (checksPass) {
-      await status(ctx, "Conduct: checks passed");
-    } else {
-      await status(ctx, "Conduct: checks failed, sending to reviewer");
+    if (signal?.aborted) {
+      return finishCancelled(iteration, modifiedFiles, checks, lastReview, diff.stat);
     }
+
+    progress.completeStep();
 
     // §16.4: if checks fail and continueAfterCheckFailure is false, stop now.
     if (!checksPass && !config.loop.continueAfterCheckFailure) {
@@ -245,9 +309,8 @@ export async function runConductWorkflow(
       );
       updateState("failed", { error: reason });
       if (runDir) saveFinalSummary(runDir, summary);
-      await status(ctx, "Conduct: stopped (checks failed)");
       notify(ctx, "Conduct stopped: checks failed", "warning");
-      await clearStatus(ctx);
+      progress.finish();
       return {
         success: false,
         reason,
@@ -261,7 +324,11 @@ export async function runConductWorkflow(
 
     // --- Reviewing (§12) ---
     updateState("reviewing");
-    await status(ctx, "Conduct: reviewing iteration");
+    progress.startStep(
+      `Review ${iteration}/${config.loop.maxIterations}`,
+      "Starting reviewer sub-agent…",
+      config.models.reviewer,
+    );
 
     // §16.3: flag when the coder made no progress so the reviewer can judge
     // whether the failure is recoverable or a blocker.
@@ -300,15 +367,13 @@ export async function runConductWorkflow(
       runDir ? path.join(getIterationDir(runDir, iteration), "checks") : undefined,
     );
 
-    const reviewerResult: ReviewerResult = await runReviewer(reviewerPrompt, config, ctx, signal);
-    reviewHistory.push(reviewerResult.review);
-    lastReview = reviewerResult.review;
-
-    const counts = countFindings(reviewerResult.review);
-    updateState("reviewing", {
-      reviewStatus: reviewerResult.review.status,
-      reviewFindingCount: counts,
-    });
+    const reviewerResult: ReviewerResult = await runReviewer(
+      reviewerPrompt,
+      config,
+      ctx,
+      signal,
+      progress,
+    );
 
     if (runDir) {
       const iterDir = getIterationDir(runDir, iteration);
@@ -321,6 +386,20 @@ export async function runConductWorkflow(
         config.artifacts.keepTranscripts,
       );
     }
+
+    if (signal?.aborted) {
+      return finishCancelled(iteration, modifiedFiles, checks, lastReview, diff.stat);
+    }
+
+    reviewHistory.push(reviewerResult.review);
+    lastReview = reviewerResult.review;
+    progress.completeStep();
+
+    const counts = countFindings(reviewerResult.review);
+    updateState("reviewing", {
+      reviewStatus: reviewerResult.review.status,
+      reviewFindingCount: counts,
+    });
 
     const requiredChecksPass = checksPass;
     const hasBlockingFindings = reviewerResult.review.findings.some(
@@ -344,9 +423,8 @@ export async function runConductWorkflow(
       );
       updateState("completed");
       if (runDir) saveFinalSummary(runDir, summary);
-      await status(ctx, "Conduct: reviewer approved");
       notify(ctx, "Conduct completed successfully", "info");
-      await clearStatus(ctx);
+      progress.finish();
       return {
         success: true,
         reason: "Reviewer approved, all checks passed",
@@ -372,9 +450,8 @@ export async function runConductWorkflow(
       );
       updateState("needsUserIntervention", { error: reason });
       if (runDir) saveFinalSummary(runDir, summary);
-      await status(ctx, "Conduct: blocked");
       notify(ctx, `Conduct blocked: ${reviewerResult.review.summary}`, "warning");
-      await clearStatus(ctx);
+      progress.finish();
       return {
         success: false,
         reason,
@@ -405,9 +482,8 @@ export async function runConductWorkflow(
       );
       updateState("completed", { error: reason });
       if (runDir) saveFinalSummary(runDir, summary);
-      await status(ctx, "Conduct: stopped (only minor findings remain)");
       notify(ctx, "Conduct stopped: only minor findings remain", "warning");
-      await clearStatus(ctx);
+      progress.finish();
       return {
         success: false,
         reason,
@@ -434,13 +510,12 @@ export async function runConductWorkflow(
       );
       updateState("failed", { error: reason });
       if (runDir) saveFinalSummary(runDir, summary);
-      await status(ctx, "Conduct: max iterations reached");
       notify(
         ctx,
         `Conduct stopped: max iterations (${config.loop.maxIterations}) reached`,
         "warning",
       );
-      await clearStatus(ctx);
+      progress.finish();
       return {
         success: false,
         reason,
@@ -454,16 +529,20 @@ export async function runConductWorkflow(
     }
 
     // --- Continue to next iteration ---
-    await status(
-      ctx,
-      `Conduct: reviewer found ${counts.blocking} blocking, ${counts.important} important, ${counts.minor} minor`,
-    );
   }
 
   // Loop exited without a verdict (e.g. aborted).
-  const reason = signal?.aborted
-    ? "Workflow aborted"
-    : "Workflow loop ended without approval";
+  if (signal?.aborted) {
+    return finishCancelled(
+      state.iteration,
+      lastModifiedFiles,
+      lastChecks,
+      lastReview,
+      lastDiffStat,
+    );
+  }
+
+  const reason = "Workflow loop ended without approval";
   const summary = buildFailureSummary(
     reason,
     userPrompt,
@@ -472,13 +551,13 @@ export async function runConductWorkflow(
     { stat: lastDiffStat, modifiedFiles: lastModifiedFiles },
     artifactPath,
   );
-  updateState(signal?.aborted ? "failed" : "failed", { error: reason });
+  updateState("failed", { error: reason });
   if (runDir) saveFinalSummary(runDir, summary);
-  await clearStatus(ctx);
+  progress.finish();
   return {
     success: false,
     reason,
-    iterations: config.loop.maxIterations,
+    iterations: state.iteration,
     modifiedFiles: lastModifiedFiles,
     summary,
     artifactPath,

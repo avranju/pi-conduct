@@ -16,10 +16,11 @@ export async function runCheckCommand(
   command: string,
   exec: Exec,
   timeoutMs: number = 120_000,
+  signal?: AbortSignal,
 ): Promise<CheckResult> {
   const start = Date.now();
   try {
-    const result = await exec("sh", ["-c", command], { timeout: timeoutMs });
+    const result = await exec("sh", ["-c", command], { timeout: timeoutMs, signal });
     return {
       command,
       exitCode: result.code,
@@ -42,6 +43,7 @@ export async function runCheckCommand(
 export async function runConfiguredChecks(
   commands: { format: string[]; lint: string[]; test: string[] },
   exec: Exec,
+  signal?: AbortSignal,
 ): Promise<CheckGroup[]> {
   const groups: CheckGroup[] = [];
 
@@ -54,7 +56,12 @@ export async function runConfiguredChecks(
     if (cmds.length === 0) continue;
     const results: CheckResult[] = [];
     for (const cmd of cmds) {
-      results.push(await runCheckCommand(cmd, exec));
+      if (signal?.aborted) return groups;
+      results.push(await runCheckCommand(cmd, exec, 120_000, signal));
+      if (signal?.aborted) {
+        groups.push({ groupName, results });
+        return groups;
+      }
     }
     groups.push({ groupName, results });
   }
