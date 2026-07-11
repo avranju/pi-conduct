@@ -47,7 +47,7 @@ export function loadConfig(cwd: string, agentDir = getAgentDir()): LoadConfigRes
   return { config, warnings: [...warnings, ...validateConfig(config)], configPaths };
 }
 
-function mergeConfig(base: ConductConfig, override: Partial<ConductConfig>): ConductConfig {
+export function mergeConfig(base: ConductConfig, override: Partial<ConductConfig>): ConductConfig {
   return {
     models: {
       planner: { ...base.models.planner, ...(override.models?.planner ?? {}) },
@@ -56,6 +56,7 @@ function mergeConfig(base: ConductConfig, override: Partial<ConductConfig>): Con
     },
     loop: { ...base.loop, ...(override.loop ?? {}) },
     safety: { ...base.safety, ...(override.safety ?? {}) },
+    retry: { ...base.retry, ...(override.retry ?? {}) },
     commands: {
       format: override.commands?.format ?? base.commands.format,
       lint: override.commands?.lint ?? base.commands.lint,
@@ -129,6 +130,42 @@ function validateConfig(config: ConductConfig): string[] {
     warnings.push("WARNING: Invalid artifact root, using default .pi/conduct/runs");
     config.artifacts.root = ".pi/conduct/runs";
   }
+
+  // Transient retry config (§16.5): clamp obviously bad values.
+  const retry = config.retry;
+  if (retry.maxRetries < 0) {
+    warnings.push(`WARNING: retry.maxRetries ${retry.maxRetries} < 0, clamping to 0`);
+    retry.maxRetries = 0;
+  }
+  if (retry.baseDelayMs < 0) {
+    warnings.push(`WARNING: retry.baseDelayMs ${retry.baseDelayMs} < 0, clamping to 0`);
+    retry.baseDelayMs = 0;
+  }
+  if (retry.maxDelayMs < 0) {
+    warnings.push(`WARNING: retry.maxDelayMs ${retry.maxDelayMs} < 0, clamping to 0`);
+    retry.maxDelayMs = 0;
+  }
+  if (retry.maxDelayMs < retry.baseDelayMs && retry.maxDelayMs > 0) {
+    warnings.push(
+      `WARNING: retry.maxDelayMs ${retry.maxDelayMs} < retry.baseDelayMs ${retry.baseDelayMs}, raising maxDelayMs`,
+    );
+    retry.maxDelayMs = retry.baseDelayMs;
+  }
+  if (retry.timeoutMs < 0) {
+    warnings.push(`WARNING: retry.timeoutMs ${retry.timeoutMs} < 0, clamping to 0`);
+    retry.timeoutMs = 0;
+  }
+  // Drop user patterns that are not valid regex; keep the rest.
+  const validPatterns: string[] = [];
+  for (const pattern of retry.retryableErrorPatterns) {
+    try {
+      new RegExp(pattern, "i");
+      validPatterns.push(pattern);
+    } catch {
+      warnings.push(`WARNING: retry.retryableErrorPatterns entry is not valid regex and was dropped: ${pattern}`);
+    }
+  }
+  retry.retryableErrorPatterns = validPatterns;
 
   return warnings;
 }

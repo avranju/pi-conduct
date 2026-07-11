@@ -2,7 +2,7 @@
 // Utility Functions
 // ============================================================================
 
-import type { ReviewResult } from "./schemas.js";
+import type { ReviewResult, RetryConfig } from "./schemas.js";
 
 /**
  * Truncate text to max bytes, appending a truncation notice.
@@ -228,4 +228,129 @@ export function countFindings(review: ReviewResult): FindingCounts {
 /** True when the review has blocking or important findings (i.e. not only minor). */
 export function hasNonMinorFindings(review: ReviewResult): boolean {
   return review.findings.some((f) => f.severity === "blocking" || f.severity === "important");
+}
+
+// ============================================================================
+// Transient model/transport error classification (§16.5)
+// ============================================================================
+//
+// Used by the agent retry wrapper to decide whether a failed agent turn should
+// be retried. Mirrors the transient-error heuristics used by the Pi SDK's own
+// in-turn retry (overloaded / rate limit / 5xx / network / fetch / socket /
+// stream / websocket failures) and adds common Node fetch error codes. Quota,
+// billing, and authentication failures are NOT retryable — retrying will not
+// help and only delays surfacing the real problem.
+
+const TRANSIENT_ERROR_PATTERNS: RegExp[] = [
+  /overloaded/i,
+  /rate.?limit/i,
+  /too many requests/i,
+  /\b429\b/,
+  /\b5\d\d\b/,
+  /service.?unavailable/i,
+  /server.?error/i,
+  /internal.?error/i,
+  /provider.?returned.?error/i,
+  /network.?error/i,
+  /connection.?(error|refused|lost|reset|closed|aborted)/i,
+  /other side closed/i,
+  /fetch failed/i,
+  /upstream.?connect/i,
+  /reset before headers/i,
+  /socket hang up/i,
+  /timed.?out/i,
+  /\btimeout\b/i,
+  /terminated/i,
+  /websocket.?(closed|error)/i,
+  /ended without/i,
+  /stream ended/i,
+  /http2 request did not get a response/i,
+  /econnrefused/i,
+  /econnreset/i,
+  /epipe/i,
+  /eai_again/i,
+  /retry delay/i,
+  /you can retry your request/i,
+  /try your request again/i,
+  /please retry your request/i,
+];
+
+const NON_RETRYABLE_ERROR_PATTERNS: RegExp[] = [
+  /insufficient_quota/i,
+  /out of budget/i,
+  /quota exceeded/i,
+  /billing/i,
+  /GoUsageLimitError/i,
+  /FreeUsageLimitError/i,
+  /monthly usage limit reached/i,
+  /available balance/i,
+  /\b401\b/,
+  /\b403\b/,
+  /unauthor/i,
+  /forbidden/i,
+  /invalid api key/i,
+  /authentication/i,
+  /context (length|window|overflow|limit)/i,
+];
+
+/**
+ * Returns true when an error message looks like a transient model/transport
+ * failure that might succeed on retry (e.g. a crashed inference server coming
+ * back up). Non-retryable failures (auth, quota, context overflow) return false.
+ */
+export function isTransientModelError(
+  errorMessage: string | undefined,
+  extraPatterns: string[] = [],
+): boolean {
+  if (!errorMessage) return false;
+  for (const pattern of NON_RETRYABLE_ERROR_PATTERNS) {
+    if (pattern.test(errorMessage)) return false;
+  }
+  for (const pattern of TRANSIENT_ERROR_PATTERNS) {
+    if (pattern.test(errorMessage)) return true;
+  }
+  for (const raw of extraPatterns) {
+    try {
+      if (new RegExp(raw, "i").test(errorMessage)) return true;
+    } catch {
+      // Invalid user regex is dropped by config validation; ignore here.
+    }
+  }
+  return false;
+}
+
+/**
+ * Compute the exponential-backoff delay for a retry attempt (1-indexed),
+ * capped by `maxDelayMs`.
+ */
+export function retryDelayFor(
+  attempt: number,
+  retry: Pick<RetryConfig, "baseDelayMs" | "maxDelayMs">,
+): number {
+  const raw = retry.baseDelayMs * 2 ** (attempt - 1);
+  if (!Number.isFinite(raw) || raw <= 0) return 0;
+  return Math.min(raw, retry.maxDelayMs);
+}
+
+/**
+ * Abortable sleep. Resolves (rather than rejecting) when the signal aborts so
+ * callers can fall through to their own abort handling.
+ */
+export function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  if (ms <= 0) return Promise.resolve();
+  return new Promise((resolve) => {
+    if (signal?.aborted) {
+      resolve();
+      return;
+    }
+    const onAbort = () => {
+      clearTimeout(timer);
+      resolve();
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
 }

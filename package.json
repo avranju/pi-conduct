@@ -10,10 +10,12 @@
   "scripts": {
     "clean": "rm -rf .pi/conduct/runs",
     "build": "tsc --noEmit",
-    "check": "tsc --noEmit"
+    "check": "tsc --noEmit",
+    "test": "tsx --test test/*.test.ts"
   },
   "devDependencies": {
     "typescript": "^5",
+    "tsx": "^4",
     "@types/node": "^22"
   },
   "peerDependencies": {

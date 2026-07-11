@@ -345,6 +345,48 @@ export interface SafetyConfig {
   blockedCommandPatterns: string[];
 }
 
+// --- Transient Retry Config ---
+
+/**
+ * Controls how Conduct retries transient model/transport failures (e.g. a
+ * locally hosted inference server such as llama.cpp crashing and restarting)
+ * before giving up on an agent turn.
+ *
+ * This wraps each role run (planner / coder / reviewer). When the underlying
+ * Pi SDK in-turn retry is exhausted and the turn ends with a retryable error,
+ * Conduct recreates the role session and re-issues the prompt, with
+ * exponential backoff capped by `maxDelayMs` and bounded by `timeoutMs`.
+ */
+export interface RetryConfig {
+  /** Whether to retry transient model/transport failures. Default: true. */
+  enabled: boolean;
+  /**
+   * Maximum retry attempts after the initial failure. 0 disables retries even
+   * when `enabled` is true. The initial attempt is always run. Default: 4.
+   */
+  maxRetries: number;
+  /**
+   * Base delay (ms) for the first retry. Each subsequent retry doubles the
+   * delay until `maxDelayMs` is reached. Default: 2000.
+   */
+  baseDelayMs: number;
+  /**
+   * Cap (ms) on the delay between any two retries. Default: 30000.
+   */
+  maxDelayMs: number;
+  /**
+   * Wall-clock budget (ms) across all retries for a single agent turn. 0 means
+   * no budget (only `maxRetries` limits the count). Default: 180000.
+   */
+  timeoutMs: number;
+  /**
+   * Extra case-insensitive regex patterns. An error message matching one of
+   * these is treated as transient (retryable) in addition to the built-in
+   * transient-error heuristics. Default: [].
+   */
+  retryableErrorPatterns: string[];
+}
+
 // --- Artifact Config ---
 
 export interface ArtifactConfig {
@@ -372,6 +414,7 @@ export interface ConductConfig {
   };
   loop: LoopConfig;
   safety: SafetyConfig;
+  retry: RetryConfig;
   commands: {
     format: string[];
     lint: string[];
@@ -412,6 +455,14 @@ export const DEFAULT_CONFIG: ConductConfig = {
   safety: {
     allowNetwork: false,
     blockedCommandPatterns: [],
+  },
+  retry: {
+    enabled: true,
+    maxRetries: 4,
+    baseDelayMs: 2000,
+    maxDelayMs: 30000,
+    timeoutMs: 180000,
+    retryableErrorPatterns: [],
   },
   commands: {
     format: [],

@@ -145,6 +145,14 @@ shortcut from the run's resolved config.
     "allowNetwork": false,
     "blockedCommandPatterns": []
   },
+  "retry": {
+    "enabled": true,
+    "maxRetries": 4,
+    "baseDelayMs": 2000,
+    "maxDelayMs": 30000,
+    "timeoutMs": 180000,
+    "retryableErrorPatterns": []
+  },
   "commands": {
     "format": ["cargo fmt --check"],
     "lint": ["cargo clippy --all-targets -- -D warnings"],
@@ -182,6 +190,12 @@ shortcut from the run's resolved config.
 | `loop.minorFindingIterationCutoff` | Stop when only minor findings remain past this iteration | `3` |
 | `safety.allowNetwork` | Allow network/package-install commands in agent bash | `false` |
 | `safety.blockedCommandPatterns` | Extra regex patterns to block in agent bash | `[]` |
+| `retry.enabled` | Retry transient model/transport failures (e.g. a crashed local inference server) before giving up on an agent turn | `true` |
+| `retry.maxRetries` | Max retry attempts after the initial failure (0 disables) | `4` |
+| `retry.baseDelayMs` | Base delay before the first retry; doubles each attempt up to `maxDelayMs` | `2000` |
+| `retry.maxDelayMs` | Cap on the delay between retries | `30000` |
+| `retry.timeoutMs` | Wall-clock budget across all retries for a turn (0 = no budget) | `180000` |
+| `retry.retryableErrorPatterns` | Extra case-insensitive regex patterns classifying an error as transient | `[]` |
 | `commands.format` | Format check commands | `[]` |
 | `commands.lint` | Lint check commands | `[]` |
 | `commands.test` | Test check commands | `[]` |
@@ -281,6 +295,39 @@ and reconciles any partial file changes already present.
 
 This is a guardrail, not a sandbox (§15). Real isolation should later use
 containers.
+
+## Transient Error Retries
+
+When a locally hosted model server (e.g. llama.cpp) crashes or restarts
+mid-inference, the request fails with a transient transport error (connection
+refused, socket hang up, 5xx, fetch failed, …). By default such failures used
+to end the Conduct run, leaving it to be resumed manually with
+`/conduct resume`.
+
+Conduct now retries these transient failures before giving up. Two layers
+cooperate:
+
+- **In-turn retry (Pi SDK).** Each role session inherits the SDK's own
+  auto-retry, which absorbs quick blips within a single agent turn and
+  preserves any in-flight tool work.
+- **Outer retry (Conduct, §16.5).** When the SDK gives up on a retryable
+  error, Conduct recreates the role session and re-issues the prompt with
+  exponential backoff capped by `retry.maxDelayMs` and bounded by a
+  `retry.timeoutMs` wall-clock budget. This comfortably covers a 20–30s
+  local-server restart.
+
+Non-transient failures (authentication errors, quota/billing exhaustion,
+context overflow, malformed agent output) are never retried — retrying would
+not help and only delays surfacing the real problem. When retries are
+exhausted the run is still left in the resumable `interrupted` state, so
+`/conduct resume` remains available for outages longer than the budget.
+
+Retries surface in the progress widget ("*Coder hit a transient error
+(2/5); retrying in 2.0s…*") and in the live sub-agent output view as
+`[transient-retry]` entries. Tune the behaviour with the `retry.*` config
+options; add provider-specific strings to `retry.retryableErrorPatterns` if
+your local server reports a transient error Conduct does not already
+recognise.
 
 ## State Machine
 

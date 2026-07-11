@@ -891,6 +891,48 @@ If checks fail and `continueAfterCheckFailure` is true, still run reviewer and i
 
 If checks fail and `continueAfterCheckFailure` is false, stop after checks and summarize.
 
+### 16.5 Transient Model/Transport Failures
+
+A role turn may fail with a transient model or transport error — most commonly
+when a locally hosted inference server (e.g. llama.cpp) crashes and restarts
+mid-inference, producing `connection refused`, `socket hang up`, `5xx`, or
+`fetch failed` errors. Without an outer retry, the SDK's in-turn retry budget
+is typically exhausted before the server returns, ending the run in the
+`interrupted` (resumable) state and forcing a manual `/conduct resume`.
+
+Conduct adds a second, outer retry layer around each role run (planner /
+coder / reviewer) governed by `retry.*` config:
+
+1. Run the role in a fresh isolated session (which inherits the SDK's own
+   in-turn auto-retry for quick blips within a turn).
+2. If the turn ends with `interrupted: true` and the error message classifies
+   as transient, or `session.prompt` throws a transient error, recreate the
+   role session and re-issue the prompt.
+3. Delay before each retry with exponential backoff
+   (`baseDelayMs * 2^(attempt-1)`), capped by `maxDelayMs`, and bounded by a
+   `timeoutMs` wall-clock budget across all retries for the turn.
+4. Stop and surface the last failure (leaving the run resumable) when retries
+   are exhausted, the budget is reached, or the workflow is cancelled.
+
+**Transient classification.** An error is retryable if its message matches a
+built-in set (overloaded / rate-limit / 5xx / network / fetch / socket /
+stream / websocket failures, Node `ECONN*`/`EAI_AGAIN` codes, provider
+retry guidance), unless it matches a non-retryable guard (auth `401`/`403`,
+`insufficient_quota`, billing, context overflow). User-supplied
+`retry.retryableErrorPatterns` add to the retryable set.
+
+**Non-transient failures** (auth, quota, context overflow, malformed agent
+JSON handled by §16.1–16.2) are never retried — retrying would not help and
+only delays surfacing the real problem.
+
+**Coder reconciliation.** Because each retry recreates the session, a coder
+retry re-issues the same prompt against the working tree; the coder inspects
+the repository and reconciles any partial file changes already on disk,
+mirroring the resume behaviour described in §13.
+
+Retries surface in the progress widget and live output viewer as
+`[transient-retry]` entries.
+
 ---
 
 ## 17. Final Summary

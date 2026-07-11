@@ -28,6 +28,14 @@
     "allowNetwork": false,
     "blockedCommandPatterns": []
   },
+  "retry": {
+    "enabled": true,
+    "maxRetries": 4,
+    "baseDelayMs": 2000,
+    "maxDelayMs": 30000,
+    "timeoutMs": 180000,
+    "retryableErrorPatterns": []
+  },
   "commands": {
     "format": [],
     "lint": [],

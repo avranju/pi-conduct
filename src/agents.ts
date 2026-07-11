@@ -38,10 +38,24 @@ import {
 } from "./validation.js";
 import { createSafeBashTool } from "./safe-bash.js";
 import { buildPlannerRepairPrompt, buildReviewerRepairPrompt } from "./prompts.js";
-import { parseJson } from "./utils.js";
+import { parseJson, isTransientModelError, retryDelayFor, sleep } from "./utils.js";
+import type { RetryConfig } from "./schemas.js";
 
 export interface AgentProgressObserver {
   observeAgent(session: AgentSession): () => void;
+  /**
+   * Called when a transient model/transport failure is about to be retried by
+   * the outer Conduct retry layer (§16.5). This is distinct from the Pi SDK's
+   * in-turn `auto_retry_start` event, which fires for retries within a single
+   * agent turn. Optional; observers may ignore it.
+   */
+  onTransientRetry?(info: {
+    role: string;
+    nextAttempt: number;
+    maxAttempts: number;
+    delayMs: number;
+    reason: string;
+  }): void;
 }
 
 // --- Role tool sets (§5) ---
@@ -176,6 +190,108 @@ export function serializeTranscript(messages: readonly unknown[]): string {
 }
 
 // ============================================================================
+// Transient retry wrapper (§16.5)
+// ============================================================================
+
+/**
+ * Minimum shape of an agent run result that the retry wrapper can inspect.
+ * All of PlannerResult / CoderResult / ReviewerResult satisfy this.
+ */
+interface RetryableResult {
+  interrupted?: boolean;
+  errors?: string[];
+}
+
+function extractErrorMessage(result: RetryableResult | undefined, thrown: unknown): string {
+  if (result?.errors && result.errors.length > 0) return result.errors[0]!;
+  if (thrown instanceof Error) return thrown.message;
+  if (thrown !== undefined) return String(thrown);
+  return "Unknown error";
+}
+
+/**
+ * Run an agent attempt, retrying transient model/transport failures with
+ * exponential backoff (capped by `retry.maxDelayMs`) and bounded by
+ * `retry.timeoutMs`. Each attempt runs in a fresh role session created by
+ * `runAttempt`; a fresh session also resets the Pi SDK's own in-turn retry
+ * budget, so quick blips are absorbed within a turn and longer outages (e.g.
+ * a local inference server restarting) are covered by this outer layer.
+ *
+ * Non-transient failures (auth, quota, context overflow, malformed output)
+ * are returned/thrown immediately without retry.
+ */
+export async function withTransientRetry<T extends RetryableResult>(
+  role: string,
+  runAttempt: (attempt: number) => Promise<T>,
+  retry: RetryConfig,
+  signal: AbortSignal | undefined,
+  progress?: AgentProgressObserver,
+): Promise<T> {
+  const maxAttempts = retry.enabled && retry.maxRetries > 0 ? retry.maxRetries + 1 : 1;
+  const startedAt = Date.now();
+  const budgetMs = retry.timeoutMs > 0 ? retry.timeoutMs : Number.POSITIVE_INFINITY;
+
+  let lastResult: T | undefined;
+  let lastThrown: unknown;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    if (signal?.aborted) {
+      if (lastResult !== undefined) return lastResult;
+      throw lastThrown;
+    }
+
+    let transient = false;
+    try {
+      lastResult = await runAttempt(attempt);
+      lastThrown = undefined;
+      transient =
+        lastResult.interrupted === true &&
+        isTransientModelError(lastResult.errors?.[0], retry.retryableErrorPatterns);
+      if (!transient) return lastResult;
+    } catch (err) {
+      lastThrown = err;
+      lastResult = undefined;
+      const message = err instanceof Error ? err.message : String(err);
+      transient = isTransientModelError(message, retry.retryableErrorPatterns);
+      if (!transient) throw err;
+    }
+
+    // Transient failure — decide whether to retry.
+    const isLastAttempt = attempt >= maxAttempts;
+    const elapsed = Date.now() - startedAt;
+    if (isLastAttempt || elapsed >= budgetMs) {
+      if (lastResult !== undefined) return lastResult;
+      throw lastThrown;
+    }
+
+    const reason = extractErrorMessage(lastResult, lastThrown);
+    let delayMs = retryDelayFor(attempt, retry);
+    const remainingBudget = budgetMs - elapsed;
+    if (Number.isFinite(remainingBudget) && delayMs > remainingBudget) {
+      delayMs = Math.max(0, remainingBudget);
+    }
+
+    progress?.onTransientRetry?.({
+      role,
+      nextAttempt: attempt + 1,
+      maxAttempts,
+      delayMs,
+      reason,
+    });
+
+    await sleep(delayMs, signal);
+    if (signal?.aborted) {
+      if (lastResult !== undefined) return lastResult;
+      throw lastThrown;
+    }
+  }
+
+  // Loop exited without a verdict (e.g. budget exhausted between iterations).
+  if (lastResult !== undefined) return lastResult;
+  throw lastThrown;
+}
+
+// ============================================================================
 // Planner Agent
 // ============================================================================
 
@@ -194,6 +310,23 @@ export async function runPlanner(
   ctx: ExtensionCommandContext,
   signal: AbortSignal | undefined,
   progress?: AgentProgressObserver,
+): Promise<PlannerResult> {
+  return withTransientRetry(
+    "planner",
+    (attempt) => runPlannerAttempt(prompt, config, ctx, signal, progress, attempt),
+    config.retry,
+    signal,
+    progress,
+  );
+}
+
+async function runPlannerAttempt(
+  prompt: string,
+  config: ConductConfig,
+  ctx: ExtensionCommandContext,
+  signal: AbortSignal | undefined,
+  progress: AgentProgressObserver | undefined,
+  _attempt: number,
 ): Promise<PlannerResult> {
   const session = await createRoleSession(ctx, config.models.planner, PLANNER_TOOLS, config.safety);
   const cleanup = wireAbort(session, signal);
@@ -226,6 +359,17 @@ export async function runPlanner(
       attempt++
     ) {
       await session.prompt(buildPlannerRepairPrompt(validation.errors));
+      const repairError = session.agent.state.errorMessage;
+      if (repairError) {
+        return {
+          rawResponse: text,
+          plan: null,
+          valid: false,
+          errors: [`Planner agent error: ${repairError}`],
+          transcript: serializeTranscript(session.agent.state.messages),
+          interrupted: true,
+        };
+      }
       text = lastAssistantText(session.agent.state.messages);
       parsed = parseJson<ImplementationPlan>(text);
       validation = parsed
@@ -277,6 +421,23 @@ export async function runCoder(
   signal: AbortSignal | undefined,
   progress?: AgentProgressObserver,
 ): Promise<CoderResult> {
+  return withTransientRetry(
+    "coder",
+    (attempt) => runCoderAttempt(prompt, config, ctx, signal, progress, attempt),
+    config.retry,
+    signal,
+    progress,
+  );
+}
+
+async function runCoderAttempt(
+  prompt: string,
+  config: ConductConfig,
+  ctx: ExtensionCommandContext,
+  signal: AbortSignal | undefined,
+  progress: AgentProgressObserver | undefined,
+  _attempt: number,
+): Promise<CoderResult> {
   const session = await createRoleSession(ctx, config.models.coder, CODER_TOOLS, config.safety);
   const cleanup = wireAbort(session, signal);
   const stopObserving = progress?.observeAgent(session) ?? (() => {});
@@ -310,6 +471,17 @@ export async function runCoder(
       await session.prompt(
         `Your previous response did not contain valid CoderCompliance JSON.\nErrors:\n${validation.errors.join("\n")}\n\nReturn only the corrected JSON in a markdown code block with the language "json".`,
       );
+      const repairError = session.agent.state.errorMessage;
+      if (repairError) {
+        return {
+          rawResponse: text,
+          compliance: null,
+          valid: false,
+          errors: [`Coder agent error: ${repairError}`],
+          transcript: serializeTranscript(session.agent.state.messages),
+          interrupted: true,
+        };
+      }
       text = lastAssistantText(session.agent.state.messages);
       parsed = parseJson<CoderCompliance>(text);
       validation = parsed
@@ -360,6 +532,23 @@ export async function runReviewer(
   signal: AbortSignal | undefined,
   progress?: AgentProgressObserver,
 ): Promise<ReviewerResult> {
+  return withTransientRetry(
+    "reviewer",
+    (attempt) => runReviewerAttempt(prompt, config, ctx, signal, progress, attempt),
+    config.retry,
+    signal,
+    progress,
+  );
+}
+
+async function runReviewerAttempt(
+  prompt: string,
+  config: ConductConfig,
+  ctx: ExtensionCommandContext,
+  signal: AbortSignal | undefined,
+  progress: AgentProgressObserver | undefined,
+  _attempt: number,
+): Promise<ReviewerResult> {
   const session = await createRoleSession(ctx, config.models.reviewer, REVIEWER_TOOLS, config.safety);
   const cleanup = wireAbort(session, signal);
   const stopObserving = progress?.observeAgent(session) ?? (() => {});
@@ -397,6 +586,23 @@ export async function runReviewer(
       attempt++
     ) {
       await session.prompt(buildReviewerRepairPrompt(validation.errors));
+      const repairError = session.agent.state.errorMessage;
+      if (repairError) {
+        return {
+          rawResponse: text,
+          review: {
+            status: "blocked",
+            summary: `Reviewer agent error: ${repairError}`,
+            findings: [],
+            testsToRun: [],
+            riskNotes: ["Reviewer agent failed to complete"],
+          },
+          valid: false,
+          errors: [`Reviewer agent error: ${repairError}`],
+          transcript: serializeTranscript(session.agent.state.messages),
+          interrupted: true,
+        };
+      }
       text = lastAssistantText(session.agent.state.messages);
       parsed = parseJson<ReviewResult>(text);
       validation = parsed

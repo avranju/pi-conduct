@@ -213,12 +213,33 @@ export class ConductProgress {
           this.setActivity(`Retrying model request (${event.attempt}/${event.maxAttempts})…`);
           this.appendDetail(`\n[retry] ${event.errorMessage}\n`);
           break;
+        case "auto_retry_end":
+          if (!event.success) {
+            this.setActivity("Model retries exhausted; retrying the agent turn…");
+          }
+          break;
         case "compaction_start":
           this.setActivity("Compacting sub-agent context…");
           this.appendDetail("\n[compacting context]\n");
           break;
       }
     });
+  }
+
+  onTransientRetry(info: {
+    role: string;
+    nextAttempt: number;
+    maxAttempts: number;
+    delayMs: number;
+    reason: string;
+  }): void {
+    const roleLabel = capitalize(info.role);
+    this.setActivity(
+      `${roleLabel} hit a transient error (${info.nextAttempt}/${info.maxAttempts}); retrying in ${formatElapsed(info.delayMs)}…`,
+    );
+    this.appendDetail(
+      `\n[transient-retry] ${info.role} attempt ${info.nextAttempt}/${info.maxAttempts} after ${formatElapsed(info.delayMs)}: ${info.reason}\n`,
+    );
   }
 
   async showDetails(ctx: ExtensionContext): Promise<void> {
