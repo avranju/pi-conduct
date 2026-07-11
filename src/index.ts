@@ -329,7 +329,7 @@ export default function conductExtension(pi: ExtensionAPI) {
             "",
             `Artifacts: ${runDir.root}`,
             "",
-            "Future: use /conduct --allow-dirty <prompt> (not yet implemented).",
+            "To run anyway, set loop.requireCleanGit to false in .pi/conduct/config.json.",
           ].join("\n");
           ctx.ui.notify(msg, "error");
           return;

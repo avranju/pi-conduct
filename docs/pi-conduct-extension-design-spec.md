@@ -353,7 +353,6 @@ If `requireCleanGit` is true and output is non-empty, abort with a clear message
 Recommended future extension:
 
 ```text
-/conduct --allow-dirty <prompt>
 /conduct --stash <prompt>
 /conduct --branch conduct/<slug> <prompt>
 ```
