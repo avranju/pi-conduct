@@ -81,6 +81,7 @@ export async function runConductWorkflow(
         ...resume.state,
         status: "running",
         attempt: resume.state.attempt + 1,
+        inFlightRole: undefined,
         error: undefined,
         interruptionKind: undefined,
         updatedAt: new Date().toISOString(),
@@ -265,16 +266,24 @@ export async function runConductWorkflow(
       const coderPrompt = buildCoderPrompt(
         userPrompt, plan, iteration, previousFeedback, checkOutputText, recoveryNote,
       );
+      const coderIterationDir = runDir
+        ? getIterationAttemptDir(runDir, iteration, state.attempt)
+        : undefined;
+      if (coderIterationDir) saveCoderPrompt(coderIterationDir, coderPrompt);
+      updateState(coderStage, "coder", { iteration, inFlightRole: "coder" });
       coderResult = await runCoder(coderPrompt, config, ctx, signal, progress);
       lastCoderCompliance = coderResult.compliance;
-      if (runDir) {
-        const iterDir = getIterationAttemptDir(runDir, iteration, state.attempt);
-        saveCoderPrompt(iterDir, coderPrompt);
-        saveCoderArtifacts(iterDir, coderResult.rawResponse, coderResult.compliance ?? {
+      if (coderIterationDir && runDir) {
+        saveCoderArtifacts(coderIterationDir, coderResult.rawResponse, coderResult.compliance ?? {
           summary: "(none)", filesChanged: [], planItemsCompleted: [], planItemsSkipped: [],
           reviewerItemsAddressed: [], commandsRun: [], knownIssues: coderResult.errors ?? [],
         });
-        saveTranscript(runDir, path.join(iterDir, "coder-transcript.json"), coderResult.transcript, config.artifacts.keepTranscripts);
+        saveTranscript(
+          runDir,
+          path.join(coderIterationDir, "coder-transcript.json"),
+          coderResult.transcript,
+          config.artifacts.keepTranscripts,
+        );
       }
       if (signal?.aborted) {
         return finishInterrupted("Workflow cancelled", "cancelled", iteration, lastModifiedFiles, lastChecks, lastReview, lastDiffStat);
@@ -283,7 +292,7 @@ export async function runConductWorkflow(
         return finishInterrupted(coderResult.errors?.join(", ") ?? "Coder agent was interrupted", "agent", iteration, lastModifiedFiles, lastChecks, lastReview, lastDiffStat);
       }
       action = "checks";
-      await checkpoint("runningChecks", "checks", { iteration });
+      await checkpoint("runningChecks", "checks", { iteration, inFlightRole: undefined });
     }
 
     // --- Collect Git Diff (§8) ---
@@ -402,6 +411,10 @@ export async function runConductWorkflow(
           : undefined,
     );
 
+    const reviewerIterationDir = runDir
+      ? getIterationAttemptDir(runDir, iteration, state.attempt)
+      : undefined;
+    if (reviewerIterationDir) saveReviewerPrompt(reviewerIterationDir, reviewerPrompt);
     const reviewerResult: ReviewerResult = await runReviewer(
       reviewerPrompt,
       config,
@@ -410,13 +423,11 @@ export async function runConductWorkflow(
       progress,
     );
 
-    if (runDir) {
-      const iterDir = getIterationAttemptDir(runDir, iteration, state.attempt);
-      saveReviewerPrompt(iterDir, reviewerPrompt);
-      saveReviewerArtifacts(iterDir, reviewerResult.rawResponse, reviewerResult.review);
+    if (reviewerIterationDir && runDir) {
+      saveReviewerArtifacts(reviewerIterationDir, reviewerResult.rawResponse, reviewerResult.review);
       saveTranscript(
         runDir,
-        path.join(iterDir, "reviewer-transcript.json"),
+        path.join(reviewerIterationDir, "reviewer-transcript.json"),
         reviewerResult.transcript,
         config.artifacts.keepTranscripts,
       );

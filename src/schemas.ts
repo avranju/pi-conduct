@@ -513,6 +513,8 @@ export interface RunState {
   repoRoot?: string;
   baseHead?: string;
   workspaceFingerprint?: string;
+  /** Role whose invocation had started when the state was last checkpointed. */
+  inFlightRole?: "coder";
   interruptionKind?: "cancelled" | "agent" | "unexpected";
   error?: string;
   updatedAt: string;

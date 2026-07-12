@@ -74,7 +74,8 @@ export async function loadResumeRun(
     !Number.isInteger(state.iteration) ||
     state.iteration < 0 ||
     !Number.isInteger(state.attempt) ||
-    state.attempt < 1
+    state.attempt < 1 ||
+    typeof state.baseHead !== "string"
   ) {
     throw new Error("Run predates resumable state format and cannot be resumed safely");
   }
@@ -88,18 +89,24 @@ export async function loadResumeRun(
   if (!state.workspaceFingerprint) {
     throw new Error("Run has no workspace checkpoint and cannot be resumed safely");
   }
+  const currentHead = await getGitHead(exec);
+  if (currentHead !== state.baseHead) {
+    throw new Error("The repository HEAD changed since Conduct started and cannot be resumed safely");
+  }
   const currentFingerprint = await fingerprintWorkspace(exec, [dir.root]);
-  if (currentFingerprint !== state.workspaceFingerprint) {
+  // A parent-process crash can occur while an in-flight coder is writing. Its
+  // next checkpoint has not yet been saved, so those partial changes are
+  // expected to differ from the pre-coder fingerprint. The other roles do not
+  // write to the workspace, so a mismatch there remains unsafe and is rejected.
+  const hasRecoverableCoderChanges =
+    abandoned &&
+    state.resumeAction === "coder" &&
+    state.inFlightRole === "coder" &&
+    currentFingerprint !== state.workspaceFingerprint;
+  if (currentFingerprint !== state.workspaceFingerprint && !hasRecoverableCoderChanges) {
     throw new Error(
       "The working tree has changed since Conduct was interrupted. Restore the checkpointed workspace before resuming.",
     );
-  }
-  if (abandoned) {
-    state.status = "interrupted";
-    state.interruptionKind = "unexpected";
-    state.error = "Previous Conduct process exited without a terminal checkpoint";
-    state.updatedAt = new Date().toISOString();
-    saveState(dir, state);
   }
 
   let plan: ImplementationPlan | undefined;
@@ -129,7 +136,11 @@ export async function loadResumeRun(
   const handoffIteration = state.resumeAction === "coder" ? state.iteration - 1 : state.iteration;
   if (handoffIteration > 0) {
     const checksPath = findLatestIterationFile(dir, handoffIteration, path.join("checks", "results.json"));
-    if (checksPath) lastChecks = readJson<CheckGroup[]>(checksPath);
+    if (checksPath) {
+      const savedChecks = readJson<unknown>(checksPath);
+      if (!isCheckGroups(savedChecks)) throw new Error("Saved check results are invalid");
+      lastChecks = savedChecks;
+    }
     const compliancePath = findLatestIterationFile(dir, handoffIteration, "coder-compliance.json");
     if (compliancePath) {
       const compliance = readJson<CoderCompliance>(compliancePath);
@@ -157,12 +168,41 @@ export async function loadResumeRun(
     if (hasConfiguredChecks) throw new Error("Run is missing the check checkpoint required for resume");
   }
 
+  if (abandoned) {
+    state.status = "interrupted";
+    state.interruptionKind = "unexpected";
+    state.error = hasRecoverableCoderChanges
+      ? "Previous Conduct process exited while the coder may have made partial changes"
+      : "Previous Conduct process exited without a terminal checkpoint";
+    state.workspaceFingerprint = currentFingerprint;
+    state.updatedAt = new Date().toISOString();
+    saveState(dir, state);
+  }
+
   return {
     dir,
     userPrompt: readText(dir.userPromptPath),
     config,
     resume: { state, plan, reviewHistory, lastChecks, lastCoderCompliance },
   };
+}
+
+function isCheckGroups(value: unknown): value is CheckGroup[] {
+  return Array.isArray(value) && value.every((group) => {
+    if (!group || typeof group !== "object") return false;
+    const candidate = group as { groupName?: unknown; results?: unknown };
+    return typeof candidate.groupName === "string" &&
+      Array.isArray(candidate.results) &&
+      candidate.results.every((result) => {
+        if (!result || typeof result !== "object") return false;
+        const check = result as Record<string, unknown>;
+        return typeof check.command === "string" &&
+          typeof check.exitCode === "number" &&
+          typeof check.stdout === "string" &&
+          typeof check.stderr === "string" &&
+          typeof check.durationMs === "number";
+      });
+  });
 }
 
 export async function markRunInterrupted(

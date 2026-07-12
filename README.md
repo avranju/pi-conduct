@@ -91,9 +91,14 @@ leaves the workflow running. Confirmed cancellation propagates to the active
 planner/coder/reviewer session and to any configured check command that is
 currently running. File changes already made are retained.
 Cancelled runs and runs interrupted by provider, quota, billing, authentication,
-or unexpected runtime errors retain a resumable checkpoint. Conduct restarts
-the interrupted stage from persisted structured artifacts; it does not attempt
-to continue a partial token stream or tool call.
+or unexpected runtime errors retain a resumable checkpoint. If Pi quits or
+crashes, `/conduct resume <run-id>` also detects the abandoned `running` state
+from the stale run lock and persisted artifacts. Conduct restarts the interrupted
+stage from persisted structured artifacts; it does not attempt to continue a
+partial token stream or tool call. Partial workspace changes from an abandoned,
+in-flight coder are retained and reconciled by the restarted coder, provided
+`HEAD` has not changed; changes while any non-writing or pending stage was
+active are still rejected.
 
 When the workflow ends, Conduct copies the final progress rows into the final
 chat summary and removes the live widget. Subsequent Pi messages therefore
@@ -274,10 +279,12 @@ Every `/conduct` run gets a unique run directory:
 `state.json` persists workflow status separately from the active work stage,
 the next resumable action, attempt number, repository identity, and a workspace
 fingerprint. JSON checkpoints are written with an atomic replace. Resume is
-rejected if the repository or working tree changed after interruption, and a
-per-run lock prevents concurrent execution. Completed artifacts are reused;
-an interrupted coder is restarted with explicit recovery context so it inspects
-and reconciles any partial file changes already present.
+rejected if the repository or working tree changed after interruption, except
+for partial changes made while an abandoned, in-flight coder was active; the
+original Git `HEAD` must still match in every case. A per-run lock prevents concurrent
+execution. Completed artifacts are reused; an interrupted coder is restarted
+with explicit recovery context so it inspects and reconciles any partial file
+changes already present.
 
 ## Safety Policy
 
