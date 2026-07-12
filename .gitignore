@@ -1,6 +1,8 @@
 # Dependencies
 node_modules/
 
+.pi-subagents/
+
 # Pi runtime artifacts created when testing by running pi from this directory
 .pi/conduct/runs/
 
