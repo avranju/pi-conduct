@@ -1,10 +1,18 @@
-import type {
-  AgentSession,
-  ExtensionCommandContext,
-  ExtensionContext,
-  Theme,
-} from "@earendil-works/pi-coding-agent";
 import {
+  AssistantMessageComponent,
+  ToolExecutionComponent,
+  UserMessageComponent,
+  getMarkdownTheme,
+  type AgentSession,
+  type AgentSessionEvent,
+  type ExtensionCommandContext,
+  type ExtensionContext,
+  type Theme,
+} from "@earendil-works/pi-coding-agent";
+import type { AssistantMessage } from "@earendil-works/pi-ai";
+import {
+  Container,
+  Text,
   type Component,
   type Focusable,
   type TUI,
@@ -12,7 +20,6 @@ import {
   matchesKey,
   truncateToWidth,
   visibleWidth,
-  wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
 import { formatKeybindings, matchesAnyKey } from "./keybindings.js";
 
@@ -36,11 +43,6 @@ interface ProgressStep {
   durationMs?: number;
 }
 
-interface DetailEntry {
-  toolCallId?: string;
-  prefix?: string;
-  text: string;
-}
 
 /**
  * Owns the compact workflow widget and the optional live sub-agent output view.
@@ -49,7 +51,7 @@ interface DetailEntry {
  */
 export class ConductProgress {
   private readonly steps: ProgressStep[] = [];
-  private readonly detailEntries: DetailEntry[] = [];
+  private readonly detailTranscript = new PiOutputTranscript();
   private detailTitle = "Conduct activity";
   private detailViewer?: LiveOutputViewer;
   private detailDialogOpen = false;
@@ -80,7 +82,7 @@ export class ConductProgress {
       startedAt: Date.now(),
     });
     this.detailTitle = title;
-    this.detailEntries.length = 0;
+    this.detailTranscript.reset();
     this.render();
     this.startActivityTimer();
     this.scheduleDetailRender();
@@ -125,6 +127,7 @@ export class ConductProgress {
     this.ctx.ui.setWidget(WIDGET_KEY, undefined);
     if (this.detailRenderTimer) clearTimeout(this.detailRenderTimer);
     this.stopActivityTimer();
+    this.detailTranscript.detach();
     this.detailViewer?.close();
   }
 
@@ -154,8 +157,11 @@ export class ConductProgress {
    */
   observeAgent(session: AgentSession): () => void {
     let streamingKind: "thinking" | "text" | undefined;
+    this.detailTranscript.observe(session);
 
     return session.subscribe((event) => {
+      this.detailTranscript.handle(session, event);
+
       switch (event.type) {
         case "agent_start":
           this.setActivity("Starting sub-agent…");
@@ -166,43 +172,19 @@ export class ConductProgress {
         case "message_update": {
           const update = event.assistantMessageEvent;
           if (update.type === "thinking_delta") {
-            if (streamingKind !== "thinking") {
-              streamingKind = "thinking";
-              this.setActivity("Reasoning about the next action…");
-              this.appendDetail("\n[thinking]\n");
-            }
-            this.appendDetail(update.delta);
+            streamingKind = "thinking";
+            this.setActivity("Reasoning about the next action…");
           } else if (update.type === "text_delta") {
-            if (streamingKind !== "text") {
-              streamingKind = "text";
-              this.setActivity("Preparing the result…");
-              this.appendDetail("\n[assistant]\n");
-            }
-            this.appendDetail(update.delta);
+            streamingKind = "text";
+            this.setActivity("Preparing the result…");
           }
           break;
         }
         case "tool_execution_start":
           streamingKind = undefined;
           this.setActivity(describeTool(event.toolName, event.args));
-          const prefix = `\n\n[tool] ${event.toolName}\n${formatValue(event.args)}\n`;
-          this.detailEntries.push({
-            toolCallId: event.toolCallId,
-            prefix,
-            text: prefix,
-          });
-          this.scheduleDetailRender();
-          break;
-        case "tool_execution_update":
-          this.updateToolDetail(event.toolCallId, extractResultText(event.partialResult));
           break;
         case "tool_execution_end":
-          this.finishToolDetail(
-            event.toolCallId,
-            event.toolName,
-            event.isError,
-            extractResultText(event.result),
-          );
           this.setActivity(
             event.isError
               ? `${capitalize(event.toolName)} failed; assessing the result…`
@@ -211,7 +193,6 @@ export class ConductProgress {
           break;
         case "auto_retry_start":
           this.setActivity(`Retrying model request (${event.attempt}/${event.maxAttempts})…`);
-          this.appendDetail(`\n[retry] ${event.errorMessage}\n`);
           break;
         case "auto_retry_end":
           if (!event.success) {
@@ -220,9 +201,9 @@ export class ConductProgress {
           break;
         case "compaction_start":
           this.setActivity("Compacting sub-agent context…");
-          this.appendDetail("\n[compacting context]\n");
           break;
       }
+      this.scheduleDetailRender();
     });
   }
 
@@ -237,9 +218,10 @@ export class ConductProgress {
     this.setActivity(
       `${roleLabel} hit a transient error (${info.nextAttempt}/${info.maxAttempts}); retrying in ${formatElapsed(info.delayMs)}…`,
     );
-    this.appendDetail(
-      `\n[transient-retry] ${info.role} attempt ${info.nextAttempt}/${info.maxAttempts} after ${formatElapsed(info.delayMs)}: ${info.reason}\n`,
+    this.detailTranscript.addNotice(
+      `Retrying ${info.role} (${info.nextAttempt}/${info.maxAttempts}) after ${formatElapsed(info.delayMs)}: ${info.reason}`,
     );
+    this.scheduleDetailRender();
   }
 
   async showDetails(ctx: ExtensionContext): Promise<void> {
@@ -253,11 +235,13 @@ export class ConductProgress {
     try {
       await ctx.ui.custom<void>(
         (tui, theme, _keybindings, done) => {
+          this.detailTranscript.attach(tui);
           const viewer = new LiveOutputViewer(
             tui,
             theme,
             () => this.detailTitle,
-            () => this.detailEntries.map((entry) => entry.text).join(""),
+            () => this.detailTranscript.getStatsLines(),
+            (width) => this.detailTranscript.render(width),
             () => done(),
             this.liveOutputKeybindings,
           );
@@ -274,6 +258,7 @@ export class ConductProgress {
         },
       );
     } finally {
+      this.detailTranscript.detach();
       this.detailViewer = undefined;
       this.detailDialogOpen = false;
     }
@@ -331,39 +316,6 @@ export class ConductProgress {
     );
   }
 
-  private appendDetail(text: string): void {
-    if (!text) return;
-    const last = this.detailEntries[this.detailEntries.length - 1];
-    if (last && last.toolCallId === undefined) last.text += text;
-    else this.detailEntries.push({ text });
-    this.scheduleDetailRender();
-  }
-
-  private updateToolDetail(toolCallId: string, output: string): void {
-    const entry = this.detailEntries.find((item) => item.toolCallId === toolCallId);
-    if (!entry) return;
-    entry.text = (entry.prefix ?? "") + output;
-    this.scheduleDetailRender();
-  }
-
-  private finishToolDetail(
-    toolCallId: string,
-    toolName: string,
-    isError: boolean,
-    output: string,
-  ): void {
-    const entry = this.detailEntries.find((item) => item.toolCallId === toolCallId);
-    const suffix = `\n[tool ${isError ? "failed" : "completed"}] ${toolName}\n`;
-    if (entry) {
-      entry.text = (entry.prefix ?? "") + output + suffix;
-      entry.toolCallId = undefined;
-      entry.prefix = undefined;
-    } else {
-      this.detailEntries.push({ text: output + suffix });
-    }
-    this.scheduleDetailRender();
-  }
-
   private scheduleDetailRender(): void {
     if (!this.detailViewer || this.detailRenderTimer) return;
     this.detailRenderTimer = setTimeout(() => {
@@ -393,6 +345,232 @@ export class ConductProgress {
   }
 }
 
+class PiOutputTranscript {
+  private readonly sessions: AgentSession[] = [];
+  private container?: Container;
+  private tui?: TUI;
+  private readonly streamingAssistants = new Map<AgentSession, AssistantMessageComponent>();
+  private readonly tools = new Map<AgentSession, Map<string, ToolExecutionComponent>>();
+  private readonly notices: string[] = [];
+
+  reset(): void {
+    this.sessions.length = 0;
+    this.notices.length = 0;
+    this.clearRenderedState();
+    if (this.tui) this.rebuild();
+  }
+
+  observe(session: AgentSession): void {
+    if (!this.sessions.includes(session)) this.sessions.push(session);
+  }
+
+  attach(tui: TUI): void {
+    this.tui = tui;
+    this.rebuild();
+  }
+
+  detach(): void {
+    this.tui = undefined;
+    this.clearRenderedState();
+  }
+
+  addNotice(message: string): void {
+    this.notices.push(message);
+    if (this.container) this.container.addChild(new Text(message, 1, 0));
+  }
+
+  handle(session: AgentSession, event: AgentSessionEvent): void {
+    this.observe(session);
+    if (!this.container) return;
+
+    switch (event.type) {
+      case "message_start":
+        if (isAssistantMessage(event.message)) {
+          const component = this.ensureAssistant(session, event.message);
+          component.updateContent(event.message);
+          this.addMessageTools(session, event.message, false);
+        } else {
+          this.addMessage(session, event.message);
+        }
+        break;
+      case "message_update":
+        if (isAssistantMessage(event.message)) {
+          const component = this.ensureAssistant(session, event.message);
+          component.updateContent(event.message);
+          this.addMessageTools(session, event.message, false);
+        }
+        break;
+      case "message_end":
+        if (isAssistantMessage(event.message)) {
+          const component = this.ensureAssistant(session, event.message);
+          component.updateContent(event.message);
+          for (const tool of getToolCalls(event.message)) {
+            this.getTools(session).get(tool.id)?.setArgsComplete();
+          }
+          this.streamingAssistants.delete(session);
+        }
+        break;
+      case "tool_execution_start":
+        this.ensureTool(session, event.toolCallId, event.toolName, event.args).markExecutionStarted();
+        break;
+      case "tool_execution_update":
+        this.getTools(session)
+          .get(event.toolCallId)
+          ?.updateResult(toToolResult(event.partialResult, false), true);
+        break;
+      case "tool_execution_end":
+        this.getTools(session)
+          .get(event.toolCallId)
+          ?.updateResult(toToolResult(event.result, event.isError));
+        break;
+      case "auto_retry_start":
+        this.addNotice(`Retrying model request (${event.attempt}/${event.maxAttempts}): ${event.errorMessage}`);
+        break;
+      case "compaction_start":
+        this.addNotice("Compacting sub-agent context…");
+        break;
+    }
+  }
+
+  render(width: number): string[] {
+    return this.container?.render(width) ?? ["Waiting for sub-agent output…"];
+  }
+
+  getStatsLines(): string[] {
+    let input = 0;
+    let output = 0;
+    let cacheRead = 0;
+    let cacheWrite = 0;
+    let cost = 0;
+    let hasUsage = false;
+
+    for (const session of this.sessions) {
+      const stats = session.getSessionStats();
+      input += stats.tokens.input;
+      output += stats.tokens.output;
+      cacheRead += stats.tokens.cacheRead;
+      cacheWrite += stats.tokens.cacheWrite;
+      cost += stats.cost;
+      hasUsage ||= stats.tokens.total > 0;
+    }
+
+    const context = [...this.sessions]
+      .reverse()
+      .map((session) => session.getContextUsage())
+      .find((usage) => usage !== undefined);
+    const tokenParts: string[] = [];
+    if (input) tokenParts.push(`↑${formatTokens(input)}`);
+    if (output) tokenParts.push(`↓${formatTokens(output)}`);
+    if (cacheRead) tokenParts.push(`R${formatTokens(cacheRead)}`);
+    if (cacheWrite) tokenParts.push(`W${formatTokens(cacheWrite)}`);
+    if (cost) tokenParts.push(`$${cost.toFixed(3)}`);
+
+    const lines = tokenParts.length > 0 ? [`Tokens ${tokenParts.join(" · ")}`] : [];
+    if (context) {
+      const used = context.tokens === null ? "?" : formatTokens(context.tokens);
+      const percent = context.percent === null ? "?" : `${context.percent.toFixed(1)}%`;
+      lines.push(`Context ${used}/${formatTokens(context.contextWindow)} (${percent})`);
+    } else if (hasUsage) {
+      lines.push("Context unavailable");
+    }
+    return lines;
+  }
+
+  private rebuild(): void {
+    this.clearRenderedState();
+    if (!this.tui) return;
+    this.container = new Container();
+    for (const session of this.sessions) {
+      for (const message of session.messages) this.addMessage(session, message);
+    }
+    for (const notice of this.notices) this.container.addChild(new Text(notice, 1, 0));
+  }
+
+  private clearRenderedState(): void {
+    this.container = undefined;
+    this.streamingAssistants.clear();
+    this.tools.clear();
+  }
+
+  private addMessage(session: AgentSession, message: unknown): void {
+    if (!this.container) return;
+    if (isUserMessage(message)) {
+      const text = getUserText(message);
+      if (text) this.container.addChild(new UserMessageComponent(text, getMarkdownTheme()));
+      return;
+    }
+    if (isToolResultMessage(message)) {
+      this.getTools(session)
+        .get(message.toolCallId)
+        ?.updateResult(toToolResult(message, message.isError === true));
+      return;
+    }
+    if (!isAssistantMessage(message)) return;
+
+    const component = new AssistantMessageComponent(message, false, getMarkdownTheme());
+    this.container.addChild(component);
+    this.addMessageTools(session, message, true);
+  }
+
+  private ensureAssistant(session: AgentSession, message: AssistantMessage): AssistantMessageComponent {
+    const existing = this.streamingAssistants.get(session);
+    if (existing) return existing;
+    const component = new AssistantMessageComponent(message, false, getMarkdownTheme());
+    this.container?.addChild(component);
+    this.streamingAssistants.set(session, component);
+    return component;
+  }
+
+  private addMessageTools(
+    session: AgentSession,
+    message: AssistantMessage,
+    argsComplete: boolean,
+  ): void {
+    for (const tool of getToolCalls(message)) {
+      const component = this.ensureTool(session, tool.id, tool.name, tool.arguments);
+      if (argsComplete && message.stopReason !== "error" && message.stopReason !== "aborted") {
+        component.setArgsComplete();
+      }
+    }
+  }
+
+  private ensureTool(
+    session: AgentSession,
+    toolCallId: string,
+    toolName: string,
+    args: unknown,
+  ): ToolExecutionComponent {
+    const tools = this.getTools(session);
+    const existing = tools.get(toolCallId);
+    if (existing) {
+      existing.updateArgs(args);
+      return existing;
+    }
+
+    const component = new ToolExecutionComponent(
+      toolName,
+      toolCallId,
+      args,
+      undefined,
+      session.getToolDefinition(toolName),
+      this.tui!,
+      session.sessionManager.getCwd(),
+    );
+    this.container?.addChild(component);
+    tools.set(toolCallId, component);
+    return component;
+  }
+
+  private getTools(session: AgentSession): Map<string, ToolExecutionComponent> {
+    let tools = this.tools.get(session);
+    if (!tools) {
+      tools = new Map();
+      this.tools.set(session, tools);
+    }
+    return tools;
+  }
+}
+
 class LiveOutputViewer implements Component, Focusable {
   focused = false;
   private linesFromBottom = 0;
@@ -402,7 +580,8 @@ class LiveOutputViewer implements Component, Focusable {
     private readonly tui: TUI,
     private readonly theme: Theme,
     private readonly getTitle: () => string,
-    private readonly getOutput: () => string,
+    private readonly getStatsLines: () => string[],
+    private readonly renderContent: (width: number) => string[],
     private readonly done: () => void,
     private readonly closeKeybindings: KeyId[],
   ) {}
@@ -423,16 +602,14 @@ class LiveOutputViewer implements Component, Focusable {
 
   render(width: number): string[] {
     const innerWidth = Math.max(20, width - 4);
-    const raw = this.getOutput().trim() || "Waiting for sub-agent output…";
-    const wrapped = raw
-      .split("\n")
-      .flatMap((line) => wrapTextWithAnsi(line || " ", innerWidth));
-    const windowSize = 24;
-    const maxOffset = Math.max(0, wrapped.length - windowSize);
+    const stats = this.getStatsLines();
+    const content = this.renderContent(innerWidth);
+    const windowSize = Math.max(8, 24 - stats.length);
+    const maxOffset = Math.max(0, content.length - windowSize);
     this.linesFromBottom = Math.min(this.linesFromBottom, maxOffset);
-    const end = wrapped.length - this.linesFromBottom;
+    const end = content.length - this.linesFromBottom;
     const start = Math.max(0, end - windowSize);
-    const visible = wrapped.slice(start, end);
+    const visible = content.slice(start, end);
     const border = (text: string) => this.theme.fg("border", text);
     const row = (text: string) => {
       const clipped = truncateToWidth(text, innerWidth);
@@ -442,6 +619,7 @@ class LiveOutputViewer implements Component, Focusable {
     return [
       border(`╭${"─".repeat(innerWidth + 2)}╮`),
       row(this.theme.bold(this.theme.fg("accent", this.getTitle()))),
+      ...stats.map((line) => row(this.theme.fg("dim", line))),
       row(
         this.theme.fg(
           "dim",
@@ -455,7 +633,7 @@ class LiveOutputViewer implements Component, Focusable {
   }
 
   contentChanged(): void {
-    if (this.linesFromBottom === 0) this.tui.requestRender();
+    this.tui.requestRender();
   }
 
   close(): void {
@@ -494,24 +672,80 @@ function describeTool(toolName: string, args: unknown): string {
   }
 }
 
-function extractResultText(result: unknown): string {
-  if (typeof result === "string") return result;
-  if (isRecord(result) && Array.isArray(result.content)) {
-    return result.content
-      .map((part) => (isRecord(part) && typeof part.text === "string" ? part.text : ""))
-      .filter(Boolean)
-      .join("\n");
-  }
-  return result === undefined ? "" : formatValue(result);
+function isAssistantMessage(message: unknown): message is AssistantMessage {
+  return isRecord(message) && message.role === "assistant" && Array.isArray(message.content);
 }
 
-function formatValue(value: unknown): string {
-  if (typeof value === "string") return value;
-  try {
-    return JSON.stringify(value, null, 2);
-  } catch {
-    return String(value);
+function isUserMessage(message: unknown): message is Record<string, unknown> {
+  return isRecord(message) && message.role === "user";
+}
+
+function isToolResultMessage(message: unknown): message is Record<string, unknown> & {
+  toolCallId: string;
+  isError?: boolean;
+} {
+  return isRecord(message) && message.role === "toolResult" && typeof message.toolCallId === "string";
+}
+
+function getUserText(message: Record<string, unknown>): string {
+  if (typeof message.content === "string") return message.content;
+  if (!Array.isArray(message.content)) return "";
+  return message.content
+    .map((part) => (isRecord(part) && part.type === "text" && typeof part.text === "string" ? part.text : ""))
+    .join("");
+}
+
+function getToolCalls(message: AssistantMessage): Array<{
+  id: string;
+  name: string;
+  arguments: unknown;
+}> {
+  return message.content.flatMap((part) =>
+    isRecord(part) &&
+    part.type === "toolCall" &&
+    typeof part.id === "string" &&
+    typeof part.name === "string"
+      ? [{ id: part.id, name: part.name, arguments: part.arguments }]
+      : [],
+  );
+}
+
+function toToolResult(
+  result: unknown,
+  isError: boolean,
+): {
+  content: Array<{ type: string; text?: string; data?: string; mimeType?: string }>;
+  details?: unknown;
+  isError: boolean;
+} {
+  if (isRecord(result) && Array.isArray(result.content)) {
+    return {
+      content: result.content.flatMap((part) =>
+        isRecord(part) && typeof part.type === "string"
+          ? [{
+              type: part.type,
+              ...(typeof part.text === "string" ? { text: part.text } : {}),
+              ...(typeof part.data === "string" ? { data: part.data } : {}),
+              ...(typeof part.mimeType === "string" ? { mimeType: part.mimeType } : {}),
+            }]
+          : [],
+      ),
+      ...(result.details === undefined ? {} : { details: result.details }),
+      isError,
+    };
   }
+  return {
+    content: [{ type: "text", text: result === undefined ? "" : String(result) }],
+    isError,
+  };
+}
+
+function formatTokens(count: number): string {
+  if (count < 1_000) return count.toString();
+  if (count < 10_000) return `${(count / 1_000).toFixed(1)}k`;
+  if (count < 1_000_000) return `${Math.round(count / 1_000)}k`;
+  if (count < 10_000_000) return `${(count / 1_000_000).toFixed(1)}M`;
+  return `${Math.round(count / 1_000_000)}M`;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
