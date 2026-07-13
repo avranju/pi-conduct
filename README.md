@@ -67,6 +67,16 @@ Resume an interrupted run with its artifact-directory name:
 /conduct resume 2026-06-23-143012-add-rest-endpoint
 ```
 
+If you intentionally want to accept a changed working tree, use:
+
+```
+/conduct force-resume 2026-06-23-143012-add-rest-endpoint
+```
+
+`force-resume` rebases the run's workspace checkpoint to the current tree and
+is recorded in `state.json`. It still refuses a changed Git `HEAD`; use it only
+when all current changes are intentionally part of the recovery baseline.
+
 Because Pi does not normally render extension slash commands in the chat, the
 task text is persisted and rendered as a normal user message before Conduct
 starts showing progress. It remains available when scrolling back or reopening

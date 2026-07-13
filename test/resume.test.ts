@@ -136,6 +136,26 @@ describe("loadResumeRun abandoned workflows", () => {
     );
   });
 
+  it("force-resume rebases a changed workspace without relaxing the HEAD check", async () => {
+    const fixture = await createAbandonedRun("planning");
+    fs.writeFileSync(path.join(fixture.repo, "work.txt"), "intentional external edit\n");
+
+    const loaded = await loadResumeRun(
+      fixture.artifactRoot,
+      fixture.runId,
+      fixture.repo,
+      fixture.exec,
+      { forceWorkspace: true },
+    );
+
+    assert.equal(loaded.resume.state.status, "interrupted");
+    assert.match(loaded.resume.state.error!, /force-resume/);
+    assert.equal(
+      loaded.resume.state.workspaceFingerprint,
+      await fingerprintWorkspace(fixture.exec, [fixture.runDir]),
+    );
+  });
+
   it("rejects a HEAD change even when the abandoned coder left partial changes", async () => {
     const fixture = await createAbandonedRun();
     fs.writeFileSync(path.join(fixture.repo, "work.txt"), "partial coder edit\n");

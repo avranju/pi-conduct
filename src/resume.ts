@@ -41,11 +41,17 @@ export interface LoadedResumeRun {
   resume: ResumeWorkflowData;
 }
 
+export interface LoadResumeOptions {
+  /** Accept the current working tree as the new recovery checkpoint. */
+  forceWorkspace?: boolean;
+}
+
 export async function loadResumeRun(
   artifactRoot: string,
   runId: string,
   repoRoot: string,
   exec: Exec,
+  options: LoadResumeOptions = {},
 ): Promise<LoadedResumeRun> {
   if (!runId || path.basename(runId) !== runId || runId === "." || runId === "..") {
     throw new Error("Invalid Conduct run id");
@@ -103,7 +109,13 @@ export async function loadResumeRun(
     state.resumeAction === "coder" &&
     state.inFlightRole === "coder" &&
     currentFingerprint !== state.workspaceFingerprint;
-  if (currentFingerprint !== state.workspaceFingerprint && !hasRecoverableCoderChanges) {
+  const workspaceWasForced =
+    options.forceWorkspace === true && currentFingerprint !== state.workspaceFingerprint;
+  if (
+    currentFingerprint !== state.workspaceFingerprint &&
+    !hasRecoverableCoderChanges &&
+    !workspaceWasForced
+  ) {
     throw new Error(
       "The working tree has changed since Conduct was interrupted. Restore the checkpointed workspace before resuming.",
     );
@@ -168,12 +180,14 @@ export async function loadResumeRun(
     if (hasConfiguredChecks) throw new Error("Run is missing the check checkpoint required for resume");
   }
 
-  if (abandoned) {
+  if (abandoned || workspaceWasForced) {
     state.status = "interrupted";
     state.interruptionKind = "unexpected";
-    state.error = hasRecoverableCoderChanges
-      ? "Previous Conduct process exited while the coder may have made partial changes"
-      : "Previous Conduct process exited without a terminal checkpoint";
+    state.error = workspaceWasForced
+      ? "Workspace fingerprint was rebased by /conduct force-resume"
+      : hasRecoverableCoderChanges
+        ? "Previous Conduct process exited while the coder may have made partial changes"
+        : "Previous Conduct process exited without a terminal checkpoint";
     state.workspaceFingerprint = currentFingerprint;
     state.updatedAt = new Date().toISOString();
     saveState(dir, state);

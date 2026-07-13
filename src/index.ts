@@ -193,10 +193,15 @@ export default function conductExtension(pi: ExtensionAPI) {
     handler: async (args: string, ctx: ExtensionCommandContext) => {
       const commandArgs = args.trim();
       const resumeMatch = /^resume(?:\s+(.+))?$/.exec(commandArgs);
+      const forceResumeMatch = /^force-resume(?:\s+(.+))?$/.exec(commandArgs);
+      const requestedResume = resumeMatch ?? forceResumeMatch;
 
       // §3: validate input
-      if (!commandArgs || (resumeMatch && !resumeMatch[1]?.trim())) {
-        ctx.ui.notify("Usage: /conduct <task prompt> | /conduct resume <run-id>", "error");
+      if (!commandArgs || (requestedResume && !requestedResume[1]?.trim())) {
+        ctx.ui.notify(
+          "Usage: /conduct <task prompt> | /conduct resume <run-id> | /conduct force-resume <run-id>",
+          "error",
+        );
         return;
       }
 
@@ -223,14 +228,17 @@ export default function conductExtension(pi: ExtensionAPI) {
         ctx.ui.notify("Using safe default config (no config file found)", "info");
       }
 
-      if (resumeMatch) {
-        const requestedRunId = resumeMatch[1]!.trim();
+      if (requestedResume) {
+        const requestedRunId = requestedResume[1]!.trim();
+        const forceWorkspace = forceResumeMatch !== null;
         const artifactRoot = path.join(ctx.cwd, currentConfig.artifacts.root);
         try {
-          const loaded = await loadResumeRun(artifactRoot, requestedRunId, gitRoot, exec);
+          const loaded = await loadResumeRun(artifactRoot, requestedRunId, gitRoot, exec, {
+            forceWorkspace,
+          });
           pi.sendMessage({
             customType: CONDUCT_PROMPT_MESSAGE_TYPE,
-            content: `Resume Conduct run ${requestedRunId}\n\n${loaded.userPrompt}`,
+            content: `${forceWorkspace ? "Force-resume" : "Resume"} Conduct run ${requestedRunId}\n\n${loaded.userPrompt}`,
             display: true,
           });
           const repoContext = await gatherRepoContext(ctx.cwd, exec);
@@ -245,7 +253,7 @@ export default function conductExtension(pi: ExtensionAPI) {
           );
         } catch (error) {
           ctx.ui.notify(
-            `Cannot resume Conduct run: ${error instanceof Error ? error.message : String(error)}`,
+            `Cannot ${forceWorkspace ? "force-resume" : "resume"} Conduct run: ${error instanceof Error ? error.message : String(error)}`,
             "error",
           );
         }
