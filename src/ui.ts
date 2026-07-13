@@ -309,7 +309,13 @@ export class ConductProgress {
       );
     }
 
-    this.ctx.ui.setWidget(WIDGET_KEY, lines);
+    // Pi limits the string-array widget form to ten entries. Use a component
+    // factory instead so every completed Conduct step remains visible.
+    this.ctx.ui.setWidget(WIDGET_KEY, () => {
+      const container = new Container();
+      for (const line of lines) container.addChild(new Text(line, 1, 0));
+      return container;
+    });
     const current = this.currentStep();
     this.ctx.ui.setStatus(
       "conduct",
