@@ -240,6 +240,7 @@ export class ConductProgress {
             tui,
             theme,
             () => this.detailTitle,
+            () => this.currentStep()?.modelDetails,
             () => this.detailTranscript.getStatsLines(),
             (width) => this.detailTranscript.render(width),
             () => done(),
@@ -580,6 +581,7 @@ class LiveOutputViewer implements Component, Focusable {
     private readonly tui: TUI,
     private readonly theme: Theme,
     private readonly getTitle: () => string,
+    private readonly getModelDetails: () => StepModelDetails | undefined,
     private readonly getStatsLines: () => string[],
     private readonly renderContent: (width: number) => string[],
     private readonly done: () => void,
@@ -618,7 +620,10 @@ class LiveOutputViewer implements Component, Focusable {
 
     return [
       border(`╭${"─".repeat(innerWidth + 2)}╮`),
-      row(this.theme.bold(this.theme.fg("accent", this.getTitle()))),
+      row(
+        this.theme.bold(this.theme.fg("accent", this.getTitle())) +
+          this.theme.fg("dim", formatLiveOutputModelDetails(this.getModelDetails())),
+      ),
       ...stats.map((line) => row(this.theme.fg("dim", line))),
       row(
         this.theme.fg(
@@ -643,6 +648,12 @@ class LiveOutputViewer implements Component, Focusable {
   }
 
   invalidate(): void {}
+}
+
+function formatLiveOutputModelDetails(modelDetails: StepModelDetails | undefined): string {
+  if (!modelDetails) return "";
+  const thinking = modelDetails.thinkingLevel ? ` • ${modelDetails.thinkingLevel}` : "";
+  return ` · (${modelDetails.provider}) ${modelDetails.model}${thinking}`;
 }
 
 function describeTool(toolName: string, args: unknown): string {
