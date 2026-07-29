@@ -11,8 +11,8 @@
 // ============================================================================
 
 import {
-  AuthStorage,
   DefaultResourceLoader,
+  ModelRuntime,
   SessionManager,
   SettingsManager,
   createAgentSession,
@@ -21,6 +21,7 @@ import {
   type ExtensionCommandContext,
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
+import * as path from "node:path";
 
 import type {
   ConductConfig,
@@ -81,28 +82,41 @@ const MAX_JSON_RETRIES = 2;
  * - Registers a safe "bash" custom tool that overrides the built-in and
  *   enforces the conduct safety policy (§15).
  */
-async function createRoleSession(
-  ctx: ExtensionCommandContext,
+export interface RoleSessionDependencies {
+  agentDir?: string;
+  modelRuntime?: ModelRuntime;
+  sessionManager?: SessionManager;
+}
+
+export async function createRoleSession(
+  cwd: string,
   roleConfig: ModelConfig,
   tools: string[],
   safety: SafetyConfig,
+  dependencies: RoleSessionDependencies = {},
 ): Promise<AgentSession> {
-  const model = ctx.modelRegistry.find(roleConfig.provider, roleConfig.model);
+  const agentDir = dependencies.agentDir ?? getAgentDir();
+  const modelRuntime =
+    dependencies.modelRuntime ??
+    (await ModelRuntime.create({
+      authPath: path.join(agentDir, "auth.json"),
+      modelsPath: path.join(agentDir, "models.json"),
+    }));
+  const model = modelRuntime.getModel(roleConfig.provider, roleConfig.model);
   if (!model) {
     throw new Error(
       `Configured model not found: ${roleConfig.provider}/${roleConfig.model}`,
     );
   }
 
-  const authStorage = AuthStorage.create();
   const settingsManager = SettingsManager.inMemory({
     compaction: { enabled: true },
     retry: { enabled: true, maxRetries: 2 },
   });
 
   const loader = new DefaultResourceLoader({
-    cwd: ctx.cwd,
-    agentDir: getAgentDir(),
+    cwd,
+    agentDir,
     settingsManager,
     noExtensions: true,
     noSkills: true,
@@ -111,19 +125,18 @@ async function createRoleSession(
   });
   await loader.reload();
 
-  const safeBash: ToolDefinition = createSafeBashTool(ctx.cwd, safety);
+  const safeBash: ToolDefinition = createSafeBashTool(cwd, safety);
 
   const { session } = await createAgentSession({
-    cwd: ctx.cwd,
-    agentDir: getAgentDir(),
-    authStorage,
-    modelRegistry: ctx.modelRegistry,
+    cwd,
+    agentDir,
+    modelRuntime,
     model,
     thinkingLevel: roleConfig.thinkingLevel,
     tools,
     customTools: [safeBash],
     resourceLoader: loader,
-    sessionManager: SessionManager.create(ctx.cwd),
+    sessionManager: dependencies.sessionManager ?? SessionManager.create(cwd),
     settingsManager,
   });
 
@@ -328,7 +341,12 @@ async function runPlannerAttempt(
   progress: AgentProgressObserver | undefined,
   _attempt: number,
 ): Promise<PlannerResult> {
-  const session = await createRoleSession(ctx, config.models.planner, PLANNER_TOOLS, config.safety);
+  const session = await createRoleSession(
+    ctx.cwd,
+    config.models.planner,
+    PLANNER_TOOLS,
+    config.safety,
+  );
   const cleanup = wireAbort(session, signal);
   const stopObserving = progress?.observeAgent(session) ?? (() => {});
 
@@ -438,7 +456,12 @@ async function runCoderAttempt(
   progress: AgentProgressObserver | undefined,
   _attempt: number,
 ): Promise<CoderResult> {
-  const session = await createRoleSession(ctx, config.models.coder, CODER_TOOLS, config.safety);
+  const session = await createRoleSession(
+    ctx.cwd,
+    config.models.coder,
+    CODER_TOOLS,
+    config.safety,
+  );
   const cleanup = wireAbort(session, signal);
   const stopObserving = progress?.observeAgent(session) ?? (() => {});
 
@@ -549,7 +572,12 @@ async function runReviewerAttempt(
   progress: AgentProgressObserver | undefined,
   _attempt: number,
 ): Promise<ReviewerResult> {
-  const session = await createRoleSession(ctx, config.models.reviewer, REVIEWER_TOOLS, config.safety);
+  const session = await createRoleSession(
+    ctx.cwd,
+    config.models.reviewer,
+    REVIEWER_TOOLS,
+    config.safety,
+  );
   const cleanup = wireAbort(session, signal);
   const stopObserving = progress?.observeAgent(session) ?? (() => {});
 
