@@ -2,6 +2,15 @@
   "name": "pi-conduct",
   "version": "0.1.0",
   "description": "Pi extension that adds a /conduct slash command for orchestrated multi-agent coding workflows.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/avranju/pi-conduct.git"
+  },
+  "bugs": {
+    "url": "https://github.com/avranju/pi-conduct/issues"
+  },
+  "homepage": "https://github.com/avranju/pi-conduct#readme",
   "type": "module",
   "keywords": ["pi-package"],
   "pi": {

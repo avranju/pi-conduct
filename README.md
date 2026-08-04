@@ -33,7 +33,7 @@ pi install ./path/to/pi-conduct
 pi install npm:pi-conduct
 
 # From git
-pi install git:github.com/<user>/pi-conduct
+pi install git:github.com/avranju/pi-conduct
 
 # Try without installing (current run only)
 pi -e ./path/to/pi-conduct
