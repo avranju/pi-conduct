@@ -9,7 +9,7 @@ import type {
   RunState,
 } from "./schemas.js";
 import { DEFAULT_CONFIG } from "./schemas.js";
-import { mergeConfig } from "./config.js";
+import { mergeConfig, validateConfig } from "./config.js";
 import {
   findLatestIterationFile,
   getActiveRunPid,
@@ -170,7 +170,8 @@ export async function loadResumeRun(
   // Merge with defaults so runs saved before a config schema change (e.g. the
   // addition of the `retry` section) still load and run with safe defaults for
   // any newly introduced fields.
-  const config = mergeConfig(DEFAULT_CONFIG, savedConfig);
+  const config = mergeConfig(structuredClone(DEFAULT_CONFIG), savedConfig);
+  validateConfig(config);
   if (state.resumeAction === "reviewer" && lastChecks.length === 0) {
     const hasConfiguredChecks = [
       ...config.commands.format,

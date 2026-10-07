@@ -1,7 +1,4 @@
 import {
-  CODER_COMPLIANCE_JSON_SCHEMA,
-  IMPLEMENTATION_PLAN_JSON_SCHEMA,
-  REVIEW_RESULT_JSON_SCHEMA,
   type ImplementationPlan,
   type CoderCompliance,
   type ReviewResult,
@@ -27,14 +24,7 @@ export function buildPlannerPrompt(
     `---`,
     ``,
     repoContext ? `Repository context:\n${repoContext}\n` : "",
-    `Produce:`,
-    `1. A concise human-readable plan.`,
-    `2. A strict JSON object matching the ImplementationPlan schema.`,
-    ``,
-    `ImplementationPlan JSON Schema:`,
-    `---`,
-    JSON.stringify(IMPLEMENTATION_PLAN_JSON_SCHEMA, null, 2),
-    `---`,
+    `Produce a structured ImplementationPlan using the submit_plan tool. Its parameter schema defines the required handoff.`,
     ``,
     `The plan must be specific enough that a smaller coding model can implement it without re-designing the solution.`,
     ``,
@@ -51,7 +41,7 @@ export function buildPlannerPrompt(
     ``,
     `Do not include vague instructions like "update as needed". Be concrete.`,
     ``,
-    `Wrap your JSON output in a markdown code block with the language "json".`,
+    `Call submit_plan ALONE, only after all repository inspection tools have finished. A valid submission ends your run.`,
   ].join("\n");
 }
 
@@ -119,10 +109,7 @@ export function buildCoderPrompt(
 
   parts.push(
     ``,
-    `CoderCompliance JSON Schema:`,
-    `---`,
-    JSON.stringify(CODER_COMPLIANCE_JSON_SCHEMA, null, 2),
-    `---`,
+    `The submit_compliance tool defines the required CoderCompliance handoff schema.`,
     ``,
     `Rules:`,
     `- Modify only files needed for the task.`,
@@ -131,9 +118,9 @@ export function buildCoderPrompt(
     `- Add or update tests when the plan calls for it.`,
     `- Do not perform destructive shell actions.`,
     `- Do not install packages unless explicitly allowed by config.`,
-    `- At the end, provide a concise summary and a strict JSON CoderCompliance object.`,
+    `- At the end, submit a concise summary and the complete CoderCompliance report with submit_compliance.`,
     ``,
-    `Wrap your JSON output in a markdown code block with the language "json".`,
+    `Call submit_compliance ALONE, only after all edits and other tools have finished. A valid submission ends your run.`,
   );
 
   return parts.join("\n");
@@ -207,12 +194,7 @@ export function buildReviewerPrompt(
     ``,
     notes ? `Supervisor notes:\n---\n${notes}\n---\n` : "",
     ``,
-    `Return a strict JSON ReviewResult object.`,
-    ``,
-    `ReviewResult JSON Schema:`,
-    `---`,
-    JSON.stringify(REVIEW_RESULT_JSON_SCHEMA, null, 2),
-    `---`,
+    `Submit a structured ReviewResult using submit_review. Its parameter schema defines the required handoff.`,
     ``,
     `Rules:`,
     `- Be specific.`,
@@ -223,7 +205,7 @@ export function buildReviewerPrompt(
     `- If needs_changes, include actionable expectedFix values.`,
     `- If blocked, explain exactly what user decision or missing dependency is required.`,
     ``,
-    `Wrap your JSON output in a markdown code block with the language "json".`,
+    `Call submit_review ALONE, only after all inspection tools have finished. A valid submission ends your run.`,
   ].join("\n");
 }
 
@@ -237,7 +219,7 @@ export function buildPlannerRepairPrompt(errors?: string[]): string {
     : "";
   return [
     `Your previous response did not contain valid JSON matching the required ImplementationPlan schema.${errorList}`,
-    `Return only the corrected JSON in a markdown code block with the language "json".`,
+    `Call submit_plan ALONE with the corrected result.`,
     `Ensure all required fields are present, arrays are arrays, and enum values match the schema exactly.`,
   ].join("\n");
 }
@@ -248,7 +230,7 @@ export function buildReviewerRepairPrompt(errors?: string[]): string {
     : "";
   return [
     `Your previous response did not contain valid JSON matching the required ReviewResult schema.${errorList}`,
-    `Return only the corrected JSON in a markdown code block with the language "json".`,
+    `Call submit_review ALONE with the corrected result.`,
     `Ensure status is one of "approved", "needs_changes", "blocked" and all required fields are present.`,
   ].join("\n");
 }

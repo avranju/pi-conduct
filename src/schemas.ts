@@ -2,6 +2,9 @@
 // Schemas for Pi Conduct Extension
 // ============================================================================
 
+import type { ModelThinkingLevel } from "@earendil-works/pi-ai";
+import type { McpServerConfig } from "@earendil-works/pi-coding-agent";
+
 // --- Implementation Plan (Planner output) ---
 
 export type PlanFileToModify = {
@@ -310,12 +313,38 @@ export interface CheckGroup {
 
 // --- Model Role Config ---
 
-export type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
+export type ThinkingLevel = ModelThinkingLevel;
+export type AgentRole = "planner" | "coder" | "reviewer";
 
-export interface ModelConfig {
+export interface ModelSelection {
   provider: string;
   model: string;
   thinkingLevel: ThinkingLevel;
+}
+
+export interface ModelConfig extends ModelSelection {
+  /** Opt-in virtual routing. Each session switches at most once to continuation. */
+  routing?: {
+    continuation?: ModelSelection;
+    /** Used only for transient provider failures, not quota/auth/schema failures. */
+    fallback?: ModelSelection;
+  };
+}
+
+export interface SessionConfig {
+  inheritSettings: boolean;
+  inheritProviders: boolean;
+}
+
+export interface CapabilityConfig {
+  codemode: { enabled: boolean; mode: "on" | "only"; inlineBudget: number };
+  mcp: {
+    enabled: boolean;
+    /** Explicit trusted connection configs; never auto-discovers host MCP servers. */
+    servers: Record<string, McpServerConfig>;
+    /** Exact fully-qualified tool names, e.g. mcp__docs__search. No wildcards. */
+    tools: Record<AgentRole, string[]>;
+  };
 }
 
 // --- Loop Config ---
@@ -415,6 +444,8 @@ export interface ConductConfig {
   loop: LoopConfig;
   safety: SafetyConfig;
   retry: RetryConfig;
+  sessions: SessionConfig;
+  capabilities: CapabilityConfig;
   commands: {
     format: string[];
     lint: string[];
@@ -463,6 +494,15 @@ export const DEFAULT_CONFIG: ConductConfig = {
     maxDelayMs: 30000,
     timeoutMs: 180000,
     retryableErrorPatterns: [],
+  },
+  sessions: { inheritSettings: true, inheritProviders: true },
+  capabilities: {
+    codemode: { enabled: false, mode: "on", inlineBudget: 3000 },
+    mcp: {
+      enabled: false,
+      servers: {},
+      tools: { planner: [], coder: [], reviewer: [] },
+    },
   },
   commands: {
     format: [],

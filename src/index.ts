@@ -3,17 +3,20 @@ import {
   type ExtensionAPI,
   type ExtensionCommandContext,
 } from "@earendil-works/pi-coding-agent";
-import { Key, isKeyRelease, matchesKey } from "@earendil-works/pi-tui";
+import { getKeybindings, isKeyRelease } from "@earendil-works/pi-tui";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { loadConfig } from "./config.js";
-import { validateCleanGit, getGitRoot, type Exec } from "./git.js";
+import { validateCleanGit, getGitRoot, collectModifiedFiles, type Exec } from "./git.js";
 import {
   createRunDirectory,
   saveUserPrompt,
   saveConfig,
   saveFinalSummary,
   acquireRunLock,
+  acquireRepositoryLock,
+  saveState,
+  readJson,
   type RunDirectory,
 } from "./artifacts.js";
 import { ConductProgress } from "./ui.js";
@@ -22,9 +25,14 @@ import { generateRunId, slugify } from "./utils.js";
 import {
   loadResumeRun,
   markRunInterrupted,
+  initializeRunIdentity,
   type ResumeWorkflowData,
 } from "./resume.js";
-import type { ConductConfig } from "./schemas.js";
+import { emptyRunState, type ConductConfig, type RunState } from "./schemas.js";
+import { createWorkflowAgentServices, type WorkflowAgentServices } from "./runtime.js";
+import { WorkflowOwner, type ActiveWorkflow } from "./lifecycle.js";
+import { publishResult, registerResultRenderer } from "./results.js";
+import { formatUsage } from "./usage.js";
 import { getLiveOutputKeybindings, matchesAnyKey } from "./keybindings.js";
 
 // ============================================================================
@@ -35,6 +43,22 @@ const CONDUCT_PROMPT_MESSAGE_TYPE = "conduct-user-prompt";
 
 export default function conductExtension(pi: ExtensionAPI) {
   let activeProgress: ConductProgress | undefined;
+  const owner = new WorkflowOwner();
+  registerResultRenderer(pi);
+  pi.on("session_shutdown", async () => { await owner.shutdown(); });
+  pi.on("input", (_event, ctx) => {
+    if (!owner.isActive) return;
+    ctx.ui.notify("Conduct is active. Cancel it before starting parent-agent work.", "warning");
+    return { action: "handled" };
+  });
+  pi.on("tool_call", () => owner.isActive
+    ? { block: true, reason: "Conduct owns this working tree until its workflow finishes" }
+    : undefined);
+  pi.on("session_before_tree", (_event, ctx) => {
+    if (!owner.isActive) return;
+    ctx.ui.notify("Finish or cancel Conduct before navigating the session tree.", "warning");
+    return { cancel: true };
+  });
 
   pi.registerMessageRenderer(CONDUCT_PROMPT_MESSAGE_TYPE, (message) => {
     const text =
@@ -68,21 +92,27 @@ export default function conductExtension(pi: ExtensionAPI) {
     exec: Exec,
     repoContext: string,
     runDir: RunDirectory,
+    activeRun: ActiveWorkflow,
     resume?: ResumeWorkflowData,
   ): Promise<void> => {
     let releaseLock: (() => void) | undefined;
     try {
       releaseLock = acquireRunLock(runDir);
+      activeRun.addCleanup(releaseLock);
     } catch (error) {
       ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
       return;
     }
 
-    const controller = new AbortController();
+    const controller = activeRun.controller;
+    let services: WorkflowAgentServices | undefined;
     const liveOutputKeybindings = getLiveOutputKeybindings(config);
     const progress = new ConductProgress(ctx, liveOutputKeybindings);
-    activeProgress?.clear();
     activeProgress = progress;
+    activeRun.addCleanup(() => {
+      progress.clear();
+      if (activeProgress === progress) activeProgress = undefined;
+    });
     let cancellationConfirmationOpen = false;
     let cancellationConfirmationController: AbortController | undefined;
     let workflowSettled = false;
@@ -123,24 +153,34 @@ export default function conductExtension(pi: ExtensionAPI) {
       return { consume: true };
     });
 
+    activeRun.addCleanup(showDetailsOnShortcut);
     const cancelOnEscape = ctx.ui.onTerminalInput((data) => {
       if (
         isKeyRelease(data) ||
-        !matchesKey(data, Key.escape) ||
+        !getKeybindings().matches(data, "app.interrupt") ||
         progress.isShowingDetails() ||
         cancellationConfirmationOpen
       ) return;
       void requestCancellation();
       return { consume: true };
     });
+    activeRun.addCleanup(cancelOnEscape);
     const forwardHostAbort = () => controller.abort();
     if (ctx.signal) {
       if (ctx.signal.aborted) controller.abort();
       else ctx.signal.addEventListener("abort", forwardHostAbort, { once: true });
+      activeRun.addCleanup(() => ctx.signal?.removeEventListener("abort", forwardHostAbort));
     }
 
     let result: WorkflowResult;
     try {
+      if (!resume) {
+        const initial = emptyRunState(config.loop.maxIterations);
+        await initializeRunIdentity(initial, runDir, exec);
+        saveState(runDir, initial);
+      }
+      services = await createWorkflowAgentServices(config, ctx, pi, runDir.root, controller.signal);
+      progress.setUsageLedger(services.usage);
       result = await runConductWorkflow(
         userPrompt,
         config,
@@ -151,11 +191,17 @@ export default function conductExtension(pi: ExtensionAPI) {
         controller.signal,
         progress,
         resume,
+        services,
       );
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);
+      const usage = services?.usage.snapshot();
+      const modifiedFiles = await collectModifiedFiles(exec, [runDir.root]).catch(() => []);
+      let iterations = resume?.state.iteration ?? 0;
+      try { iterations = readJson<RunState>(runDir.statePath).iteration; } catch { /* Preflight may not have saved state. */ }
       const summary = [
         `Conduct was interrupted by an unexpected error: ${message}`,
+        ...(usage ? ["", formatUsage(usage.totals)] : []),
         "",
         `Resume with: /conduct resume ${path.basename(runDir.root)}`,
       ].join("\n");
@@ -170,7 +216,10 @@ export default function conductExtension(pi: ExtensionAPI) {
       const progressLines = progress.getSummaryLines();
       progress.clear();
       if (activeProgress === progress) activeProgress = undefined;
-      ctx.ui.notify([summary, "", ...progressLines].join("\n"), "error");
+      publishResult(pi, {
+        success: false, reason: message, iterations,
+        modifiedFiles, summary, artifactPath: runDir.root, resumable: true,
+      }, progressLines, usage);
       return;
     } finally {
       workflowSettled = true;
@@ -181,11 +230,13 @@ export default function conductExtension(pi: ExtensionAPI) {
       releaseLock?.();
     }
 
+    const usage = services?.usage.snapshot();
+    if (usage) result.summary += `\n\n${formatUsage(usage.totals)}`;
     saveFinalSummary(runDir, result.summary);
     const progressLines = progress.getSummaryLines();
     progress.clear();
     if (activeProgress === progress) activeProgress = undefined;
-    await printFinalSummary(result, ctx, progressLines);
+    publishResult(pi, result, progressLines, usage);
   };
 
   pi.registerCommand("conduct", {
@@ -210,6 +261,17 @@ export default function conductExtension(pi: ExtensionAPI) {
         return;
       }
 
+      if (!ctx.isIdle() || ctx.hasPendingMessages()) {
+        ctx.ui.notify("Wait for the parent agent and queued messages to finish before starting Conduct", "warning");
+        return;
+      }
+      let activeRun: ActiveWorkflow;
+      try { activeRun = owner.begin(); }
+      catch (error) {
+        ctx.ui.notify(error instanceof Error ? error.message : String(error), "warning");
+        return;
+      }
+      try {
       const exec: Exec = pi.exec.bind(pi);
 
       // Must be a git repo (§8)
@@ -219,8 +281,21 @@ export default function conductExtension(pi: ExtensionAPI) {
         return;
       }
 
+      // Serialize Conduct across Pi instances too, even when they use different run IDs.
+      const gitDir = await exec("git", ["rev-parse", "--absolute-git-dir"]);
+      if (gitDir.code !== 0 || !gitDir.stdout.trim()) {
+        ctx.ui.notify("Could not resolve the repository lock directory", "error");
+        return;
+      }
+      try { activeRun.addCleanup(acquireRepositoryLock(gitDir.stdout.trim())); }
+      catch (error) {
+        ctx.ui.notify(error instanceof Error ? error.message : String(error), "warning");
+        return;
+      }
+      activeRun.controller.signal.throwIfAborted();
+
       // --- Load Config (§4) ---
-      const { config: currentConfig, warnings, configPaths } = loadConfig(ctx.cwd);
+      const { config: currentConfig, warnings, configPaths } = loadConfig(ctx.cwd, undefined, ctx.isProjectTrusted());
       for (const warning of warnings) {
         ctx.ui.notify(warning, "warning");
       }
@@ -229,6 +304,10 @@ export default function conductExtension(pi: ExtensionAPI) {
       }
 
       if (requestedResume) {
+        if (!ctx.isProjectTrusted()) {
+          ctx.ui.notify("Trust this repository in Pi before resuming a saved Conduct configuration", "error");
+          return;
+        }
         const requestedRunId = requestedResume[1]!.trim();
         const forceWorkspace = forceResumeMatch !== null;
         const artifactRoot = path.join(ctx.cwd, currentConfig.artifacts.root);
@@ -249,6 +328,7 @@ export default function conductExtension(pi: ExtensionAPI) {
             exec,
             repoContext,
             loaded.dir,
+            activeRun,
             loaded.resume,
           );
         } catch (error) {
@@ -305,7 +385,7 @@ export default function conductExtension(pi: ExtensionAPI) {
           runDir.root,
         ].join("\n");
         saveFinalSummary(runDir, summary);
-        ctx.ui.notify(summary, "error");
+        publishResult(pi, { success: false, reason: "No check commands configured", iterations: 0, modifiedFiles: [], summary, artifactPath: runDir.root });
         return;
       }
 
@@ -339,7 +419,7 @@ export default function conductExtension(pi: ExtensionAPI) {
             "",
             "To run anyway, set loop.requireCleanGit to false in .pi/conduct/config.json.",
           ].join("\n");
-          ctx.ui.notify(msg, "error");
+          publishResult(pi, { success: false, reason: "Working tree is not clean", iterations: 0, modifiedFiles: [], summary: msg, artifactPath: runDir.root });
           return;
         }
       }
@@ -348,8 +428,10 @@ export default function conductExtension(pi: ExtensionAPI) {
 
       // --- Gather Repository Context ---
       const repoContext = await gatherRepoContext(ctx.cwd, exec);
-      await executeRun(userPrompt, config, ctx, exec, repoContext, runDir);
-
+      await executeRun(userPrompt, config, ctx, exec, repoContext, runDir, activeRun);
+      } finally {
+        activeRun.finish();
+      }
     },
   });
 }
@@ -404,54 +486,4 @@ async function gatherRepoContext(cwd: string, exec: Exec): Promise<string> {
   }
 
   return parts.join("\n\n");
-}
-
-async function printFinalSummary(
-  result: WorkflowResult,
-  ctx: ExtensionCommandContext,
-  progressLines: string[],
-): Promise<void> {
-  const lines: string[] = [];
-
-  if (result.success) {
-    lines.push("✓ Conduct completed successfully.");
-  } else {
-    lines.push("✗ Conduct stopped before approval.");
-  }
-
-  lines.push("");
-  lines.push(`Reason: ${result.reason}`);
-  lines.push(`Iterations: ${result.iterations}`);
-  lines.push(
-    `Modified files: ${result.modifiedFiles.length > 0 ? result.modifiedFiles.join(", ") : "none"}`,
-  );
-  lines.push("");
-
-  if (result.lastChecks && result.lastChecks.length > 0) {
-    const checkSummary = result.lastChecks
-      .map((g) => `${g.groupName}: ${g.results.every((r) => r.exitCode === 0) ? "✓" : "✗"}`)
-      .join(", ");
-    lines.push(`Checks: ${checkSummary}`);
-  }
-
-  if (result.lastReview) {
-    lines.push(`Last reviewer: ${result.lastReview.status}`);
-    if (result.lastReview.summary) {
-      lines.push(`  ${result.lastReview.summary}`);
-    }
-  }
-
-  lines.push("");
-  lines.push(`Artifacts: ${result.artifactPath}`);
-
-  if (result.resumable) {
-    lines.push(`Resume with: /conduct resume ${path.basename(result.artifactPath)}`);
-  }
-
-  if (progressLines.length > 0) {
-    lines.push("");
-    lines.push(...progressLines);
-  }
-
-  ctx.ui.notify(lines.join("\n"), result.success ? "info" : "warning");
 }

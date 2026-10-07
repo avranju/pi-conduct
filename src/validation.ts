@@ -188,6 +188,10 @@ export function validateReviewResult(review: unknown): ValidationResult {
     errors.push("Field findings must be an array");
   } else {
     review.findings.forEach((f, i) => {
+      if (!isObject(f)) {
+        errors.push(`findings[${i}] must be an object`);
+        return;
+      }
       const finding = f as Partial<ReviewFinding>;
       if (!isObject(f) || typeof finding.severity !== "string" || !REVIEW_SEVERITIES.has(finding.severity) || typeof finding.issue !== "string" || typeof finding.expectedFix !== "string" || typeof finding.rationale !== "string") {
         errors.push(`findings[${i}] must have { severity (enum), issue, expectedFix, rationale }`);

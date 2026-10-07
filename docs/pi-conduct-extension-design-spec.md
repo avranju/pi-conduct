@@ -1,5 +1,11 @@
 # Pi `/conduct` Extension Design Spec
 
+> This is the original design specification. The Pi 1.x implementation now uses
+> schema-backed handoff tools, durable result cards, shared workflow runtimes,
+> lifecycle/repository ownership, usage accounting, and opt-in codemode/MCP/routing.
+> See [README.md](../README.md) for current behavior and configuration; the original
+> workflow and version-1 resume checkpoint format remain intact.
+
 ## 1. Purpose
 
 Build a Pi extension that adds a custom slash command:

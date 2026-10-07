@@ -7,10 +7,10 @@ import { normalizeKeybindingList } from "./keybindings.js";
 
 // --- Config Loading (§4) ---
 
-export function findConfigFiles(cwd: string, agentDir = getAgentDir()): string[] {
+export function findConfigFiles(cwd: string, agentDir = getAgentDir(), projectTrusted = true): string[] {
   return [
     path.join(agentDir, "conduct", "config.json"),
-    path.join(cwd, ".pi", "conduct", "config.json"),
+    ...(projectTrusted ? [path.join(cwd, ".pi", "conduct", "config.json")] : []),
   ].filter((candidate) => fs.existsSync(candidate));
 }
 
@@ -20,9 +20,12 @@ export interface LoadConfigResult {
   configPaths: string[];
 }
 
-export function loadConfig(cwd: string, agentDir = getAgentDir()): LoadConfigResult {
-  const configPaths = findConfigFiles(cwd, agentDir);
+export function loadConfig(cwd: string, agentDir = getAgentDir(), projectTrusted = true): LoadConfigResult {
+  const configPaths = findConfigFiles(cwd, agentDir, projectTrusted);
   const warnings: string[] = [];
+  if (!projectTrusted && fs.existsSync(path.join(cwd, ".pi", "conduct", "config.json"))) {
+    warnings.push("Ignoring project Conduct config until the repository is trusted by Pi");
+  }
   let config = structuredClone(DEFAULT_CONFIG);
 
   if (configPaths.length === 0) {
@@ -50,13 +53,29 @@ export function loadConfig(cwd: string, agentDir = getAgentDir()): LoadConfigRes
 export function mergeConfig(base: ConductConfig, override: Partial<ConductConfig>): ConductConfig {
   return {
     models: {
-      planner: { ...base.models.planner, ...(override.models?.planner ?? {}) },
-      coder: { ...base.models.coder, ...(override.models?.coder ?? {}) },
-      reviewer: { ...base.models.reviewer, ...(override.models?.reviewer ?? {}) },
+      planner: mergeModel(base.models.planner, override.models?.planner),
+      coder: mergeModel(base.models.coder, override.models?.coder),
+      reviewer: mergeModel(base.models.reviewer, override.models?.reviewer),
     },
     loop: { ...base.loop, ...(override.loop ?? {}) },
     safety: { ...base.safety, ...(override.safety ?? {}) },
     retry: { ...base.retry, ...(override.retry ?? {}) },
+    sessions: { ...base.sessions, ...(override.sessions ?? {}) },
+    capabilities: {
+      codemode: { ...base.capabilities.codemode, ...(override.capabilities?.codemode ?? {}) },
+      mcp: {
+        ...base.capabilities.mcp,
+        ...(override.capabilities?.mcp ?? {}),
+        servers: {
+          ...base.capabilities.mcp.servers,
+          ...(override.capabilities?.mcp?.servers ?? {}),
+        },
+        tools: {
+          ...base.capabilities.mcp.tools,
+          ...(override.capabilities?.mcp?.tools ?? {}),
+        },
+      },
+    },
     commands: {
       format: override.commands?.format ?? base.commands.format,
       lint: override.commands?.lint ?? base.commands.lint,
@@ -71,7 +90,7 @@ export function mergeConfig(base: ConductConfig, override: Partial<ConductConfig
  * Validate config (§4.2). Rejects by clamping/fixing where possible and warns.
  * Returns warnings; the caller decides whether to proceed.
  */
-function validateConfig(config: ConductConfig): string[] {
+export function validateConfig(config: ConductConfig): string[] {
   const warnings: string[] = [];
 
   // §4.2.1: Missing role model config
@@ -84,6 +103,38 @@ function validateConfig(config: ConductConfig): string[] {
   if (!config.models.reviewer.provider || !config.models.reviewer.model) {
     warnings.push("WARNING: Missing reviewer model config (provider/model)");
   }
+
+  for (const role of ["planner", "coder", "reviewer"] as const) {
+    const model = config.models[role];
+    if (!THINKING_LEVELS.has(model.thinkingLevel)) {
+      warnings.push(`WARNING: Invalid ${role} thinking level, using medium`);
+      model.thinkingLevel = "medium";
+    }
+    for (const target of ["continuation", "fallback"] as const) {
+      const selection = model.routing?.[target];
+      if (selection && (!selection.provider || !selection.model || !THINKING_LEVELS.has(selection.thinkingLevel))) {
+        warnings.push(`WARNING: Invalid ${role} routing.${target}, disabling it`);
+        delete model.routing![target];
+      }
+    }
+    const allowed = config.capabilities.mcp.tools[role];
+    if (!Array.isArray(allowed) || allowed.some((name) => typeof name !== "string" || !/^mcp__[A-Za-z0-9_]+__[A-Za-z0-9_]+$/.test(name))) {
+      warnings.push(`WARNING: Invalid MCP tool allowlist for ${role}, disabling its MCP access`);
+      config.capabilities.mcp.tools[role] = [];
+    }
+  }
+  const codemode = config.capabilities.codemode;
+  codemode.enabled = codemode.enabled === true;
+  if (codemode.mode !== "on" && codemode.mode !== "only") codemode.mode = "on";
+  if (!Number.isSafeInteger(codemode.inlineBudget) || codemode.inlineBudget < 0) codemode.inlineBudget = 3000;
+  config.capabilities.mcp.enabled = config.capabilities.mcp.enabled === true;
+  if (!config.capabilities.mcp.servers || typeof config.capabilities.mcp.servers !== "object" || Array.isArray(config.capabilities.mcp.servers)) {
+    warnings.push("WARNING: Invalid MCP servers, disabling MCP access");
+    config.capabilities.mcp.servers = {};
+    config.capabilities.mcp.enabled = false;
+  }
+  config.sessions.inheritSettings = config.sessions.inheritSettings === true;
+  config.sessions.inheritProviders = config.sessions.inheritProviders === true;
 
   // §4.2.2: maxIterations < 1 — clamp to 1
   if (config.loop.maxIterations < 1) {
@@ -168,6 +219,18 @@ function validateConfig(config: ConductConfig): string[] {
   retry.retryableErrorPatterns = validPatterns;
 
   return warnings;
+}
+
+const THINKING_LEVELS = new Set(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
+
+function mergeModel(base: ConductConfig["models"]["planner"], override?: ConductConfig["models"]["planner"]): ConductConfig["models"]["planner"] {
+  return {
+    ...base,
+    ...override,
+    routing: override?.routing === undefined
+      ? base.routing
+      : { ...base.routing, ...override.routing },
+  };
 }
 
 export { DEFAULT_CONFIG };

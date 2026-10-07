@@ -8,20 +8,26 @@ import {
   type ExtensionCommandContext,
   type ExtensionContext,
   type Theme,
+  type KeybindingsManager,
 } from "@earendil-works/pi-coding-agent";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import {
   Container,
+  ScrollView,
+  VStack,
   Text,
+  isKeyRelease,
   type Component,
   type Focusable,
   type TUI,
+  type TuiMouseEvent,
   type KeyId,
   matchesKey,
   truncateToWidth,
   visibleWidth,
 } from "@earendil-works/pi-tui";
 import { formatKeybindings, matchesAnyKey } from "./keybindings.js";
+import { formatUsage, totalUsage, type RunUsageLedger, type UsageTotals } from "./usage.js";
 
 const WIDGET_KEY = "conduct-progress";
 const DETAIL_RENDER_INTERVAL_MS = 80;
@@ -57,6 +63,9 @@ export class ConductProgress {
   private detailDialogOpen = false;
   private detailRenderTimer?: ReturnType<typeof setTimeout>;
   private activityTimer?: ReturnType<typeof setInterval>;
+  private disposed = false;
+  private usageLedger?: RunUsageLedger;
+  private readonly activeSessions = new Set<AgentSession>();
 
   constructor(
     private readonly ctx: ExtensionCommandContext,
@@ -123,12 +132,26 @@ export class ConductProgress {
   }
 
   clear(): void {
+    if (this.disposed) return;
+    this.disposed = true;
     this.ctx.ui.setStatus("conduct", undefined);
     this.ctx.ui.setWidget(WIDGET_KEY, undefined);
     if (this.detailRenderTimer) clearTimeout(this.detailRenderTimer);
     this.stopActivityTimer();
     this.detailTranscript.detach();
     this.detailViewer?.close();
+  }
+
+  setUsageLedger(ledger: RunUsageLedger): void { this.usageLedger = ledger; }
+
+  private getRunUsage(): UsageTotals {
+    return totalUsage([
+      ...(this.usageLedger?.snapshot().sessions ?? []),
+      ...[...this.activeSessions].map((session) => {
+        const stats = session.getSessionStats();
+        return { ...stats.tokens, cost: stats.cost };
+      }),
+    ]);
   }
 
   /** Render the final progress history without ANSI styling for chat output. */
@@ -156,10 +179,9 @@ export class ConductProgress {
    * subscription; callers should invoke it before disposing the session.
    */
   observeAgent(session: AgentSession): () => void {
-    let streamingKind: "thinking" | "text" | undefined;
     this.detailTranscript.observe(session);
-
-    return session.subscribe((event) => {
+    this.activeSessions.add(session);
+    const unsubscribe = session.subscribe((event) => {
       this.detailTranscript.handle(session, event);
 
       switch (event.type) {
@@ -172,16 +194,25 @@ export class ConductProgress {
         case "message_update": {
           const update = event.assistantMessageEvent;
           if (update.type === "thinking_delta") {
-            streamingKind = "thinking";
             this.setActivity("Reasoning about the next action…");
           } else if (update.type === "text_delta") {
-            streamingKind = "text";
             this.setActivity("Preparing the result…");
           }
           break;
         }
+        case "message_end":
+          if (isAssistantMessage(event.message)) {
+            const current = this.currentStep();
+            if (current) {
+              current.modelDetails = {
+                provider: event.message.provider, model: event.message.model,
+                thinkingLevel: event.message.thinkingLevel ?? session.thinkingLevel,
+              };
+              this.render();
+            }
+          }
+          break;
         case "tool_execution_start":
-          streamingKind = undefined;
           this.setActivity(describeTool(event.toolName, event.args));
           break;
         case "tool_execution_end":
@@ -205,6 +236,7 @@ export class ConductProgress {
       }
       this.scheduleDetailRender();
     });
+    return () => { unsubscribe(); this.activeSessions.delete(session); };
   }
 
   onTransientRetry(info: {
@@ -234,17 +266,20 @@ export class ConductProgress {
     this.detailDialogOpen = true;
     try {
       await ctx.ui.custom<void>(
-        (tui, theme, _keybindings, done) => {
+        (tui, theme, keybindings, done) => {
           this.detailTranscript.attach(tui);
           const viewer = new LiveOutputViewer(
             tui,
             theme,
             () => this.detailTitle,
             () => this.currentStep()?.modelDetails,
-            () => this.detailTranscript.getStatsLines(),
+            () => [...this.detailTranscript.getStatsLines(), `Run total · ${formatUsage(this.getRunUsage())}`],
             (width) => this.detailTranscript.render(width),
             () => done(),
             this.liveOutputKeybindings,
+            keybindings,
+            () => ctx.ui.theme,
+            () => this.detailTranscript.invalidate(),
           );
           this.detailViewer = viewer;
           return viewer;
@@ -269,11 +304,13 @@ export class ConductProgress {
     return this.steps[this.steps.length - 1];
   }
 
-  private render(): void {
+  private renderProgressLines(): string[] {
     const theme = this.ctx.ui.theme;
     const lines: string[] = [];
+    const visibleSteps = this.steps.slice(-6);
+    if (this.steps.length > visibleSteps.length) lines.push(theme.fg("dim", `  ${this.steps.length - visibleSteps.length} earlier steps (retained in the final result)`));
 
-    for (const step of this.steps) {
+    for (const step of visibleSteps) {
       const modelDetails = step.modelDetails
         ? ` · (${step.modelDetails.provider}) ${step.modelDetails.model}${step.modelDetails.thinkingLevel ? ` / ${step.modelDetails.thinkingLevel}` : ""}`
         : "";
@@ -309,13 +346,16 @@ export class ConductProgress {
       );
     }
 
-    // Pi limits the string-array widget form to ten entries. Use a component
-    // factory instead so every completed Conduct step remains visible.
-    this.ctx.ui.setWidget(WIDGET_KEY, () => {
-      const container = new Container();
-      for (const line of lines) container.addChild(new Text(line, 1, 0));
-      return container;
-    });
+    return lines;
+  }
+
+  private render(): void {
+    if (this.disposed) return;
+    // Compute theme colors at render time, including after automatic system-theme changes.
+    this.ctx.ui.setWidget(WIDGET_KEY, () => ({
+      render: (width) => this.renderProgressLines().map((line) => truncateToWidth(line, width)),
+      invalidate: () => {},
+    }));
     const current = this.currentStep();
     this.ctx.ui.setStatus(
       "conduct",
@@ -442,6 +482,8 @@ class PiOutputTranscript {
   render(width: number): string[] {
     return this.container?.render(width) ?? ["Waiting for sub-agent output…"];
   }
+
+  invalidate(): void { this.container?.invalidate(); }
 
   getStatsLines(): string[] {
     let input = 0;
@@ -578,82 +620,123 @@ class PiOutputTranscript {
   }
 }
 
-class LiveOutputViewer implements Component, Focusable {
+export class LiveOutputViewer extends VStack implements Focusable {
   focused = false;
-  private linesFromBottom = 0;
   private closed = false;
+  readonly scrollView: ScrollView;
+  private readonly header: Component;
+  private readonly footer: Component;
 
   constructor(
     private readonly tui: TUI,
-    private readonly theme: Theme,
-    private readonly getTitle: () => string,
-    private readonly getModelDetails: () => StepModelDetails | undefined,
-    private readonly getStatsLines: () => string[],
-    private readonly renderContent: (width: number) => string[],
+    theme: Theme,
+    getTitle: () => string,
+    getModelDetails: () => StepModelDetails | undefined,
+    getStatsLines: () => string[],
+    renderContent: (width: number) => string[],
     private readonly done: () => void,
     private readonly closeKeybindings: KeyId[],
-  ) {}
+    private readonly keybindings: Pick<KeybindingsManager, "matches" | "getKeys">,
+    private readonly getTheme: () => Theme = () => theme,
+    invalidateContent: () => void = () => {},
+  ) {
+    super();
+    const header: Component = {
+      render: (width) => {
+        const currentTheme = getTheme();
+        return [
+          currentTheme.bold(currentTheme.fg("accent", getTitle())) +
+            currentTheme.fg("dim", formatLiveOutputModelDetails(getModelDetails())),
+          ...getStatsLines().map((line) => currentTheme.fg("dim", line)),
+          currentTheme.fg("border", "─".repeat(Math.max(0, width))),
+        ].map((line) => truncateToWidth(line, width));
+      },
+      invalidate: () => {},
+    };
+    const content: Component = {
+      render: (width) => renderContent(width).map((line) => truncateToWidth(line, width)),
+      invalidate: invalidateContent,
+    };
+    this.scrollView = new ScrollView(content, {
+      follow: "end", primary: true, overscroll: "contain", scrollbar: "always",
+      scrollbarTrackStyle: (text) => getTheme().fg("muted", text),
+      scrollbarThumbStyle: (text) => getTheme().fg("accent", text),
+    });
+    this.header = header;
+    this.addChild(header, { shrink: 1, minSize: 1, maxSize: 7 });
+    this.addChild(this.scrollView, { basis: 0, grow: 1, minSize: 1 });
+    this.footer = {
+      render: (width) => [truncateToWidth(getTheme().fg("dim",
+        `Live output · ↑↓/PgUp/PgDn scroll · End follow · ${formatKeybindings(keybindings.getKeys("tui.select.cancel"))}/${formatKeybindings(closeKeybindings)} close`,
+      ), width)],
+      invalidate: () => {},
+    };
+    this.addChild(this.footer, { basis: 1, minSize: 1 });
+  }
+
+  // Pi 1.0.4 lays out native stacks in the fullscreen tree, but overlays still call
+  // render(width). Use the same public ScrollView state for that compatibility path.
+  override render(width: number): string[] {
+    const height = Math.max(1, Math.floor(this.tui.terminal.rows * 0.85));
+    const header = this.header.render(width).slice(0, Math.max(0, height - 2));
+    const footer = height > 1 ? this.footer.render(width) : [];
+    const viewport = Math.max(1, height - header.length - footer.length);
+    const content = this.scrollView.render(width);
+    this.scrollView.updateLayout(content.length, viewport, () => this.tui.requestRender());
+    const start = this.scrollView.scrollTop;
+    const visible = content.slice(start, start + viewport);
+    while (visible.length < viewport) visible.push("");
+    // The native fullscreen renderer draws its own scrollbar; overlays need a compact one.
+    const thumb = Math.max(1, Math.floor(viewport * Math.min(1, viewport / Math.max(1, content.length))));
+    const top = Math.round((viewport - thumb) * start / Math.max(1, content.length - viewport));
+    return [
+      ...header,
+      ...visible.map((line, row) => {
+        if (width <= 1) return truncateToWidth(line, width);
+        const clipped = truncateToWidth(line, width - 1);
+        const scrollbar = row >= top && row < top + thumb
+          ? this.getTheme().fg("accent", "┃") : this.getTheme().fg("muted", "│");
+        return `${clipped}${" ".repeat(Math.max(0, width - 1 - visibleWidth(clipped)))}${scrollbar}`;
+      }),
+      ...footer,
+    ].slice(0, height);
+  }
+
+  override handleMouse(event: TuiMouseEvent): ReturnType<VStack["handleMouse"]> {
+    if (event.type === "wheel" && event.wheelDelta) {
+      this.scrollView.scrollBy(event.wheelDelta);
+      return {
+        handled: true, render: true,
+        target: { component: this, originX: event.screenX - event.x, originY: event.screenY - event.y, width: event.width, height: event.height },
+      };
+    }
+    return undefined;
+  }
 
   handleInput(data: string): void {
-    if (matchesKey(data, "escape") || matchesAnyKey(data, this.closeKeybindings)) {
+    if (isKeyRelease(data)) return;
+    if (this.keybindings.matches(data, "tui.select.cancel") || matchesAnyKey(data, this.closeKeybindings)) {
       this.close();
       return;
     }
-    if (matchesKey(data, "up")) this.linesFromBottom += 1;
-    else if (matchesKey(data, "down")) this.linesFromBottom = Math.max(0, this.linesFromBottom - 1);
-    else if (matchesKey(data, "pageUp")) this.linesFromBottom += 12;
-    else if (matchesKey(data, "pageDown")) this.linesFromBottom = Math.max(0, this.linesFromBottom - 12);
-    else if (matchesKey(data, "end")) this.linesFromBottom = 0;
+    const page = Math.max(1, this.scrollView.viewportHeight - 1);
+    if (this.keybindings.matches(data, "tui.select.up")) this.scrollView.scrollBy(-1);
+    else if (this.keybindings.matches(data, "tui.select.down")) this.scrollView.scrollBy(1);
+    else if (this.keybindings.matches(data, "tui.select.pageUp") || this.keybindings.matches(data, "tui.altScreen.pageUp")) this.scrollView.scrollBy(-page);
+    else if (this.keybindings.matches(data, "tui.select.pageDown") || this.keybindings.matches(data, "tui.altScreen.pageDown")) this.scrollView.scrollBy(page);
+    else if (matchesKey(data, "end") || this.keybindings.matches(data, "tui.altScreen.bottom")) this.scrollView.scrollToEnd();
+    else if (matchesKey(data, "home") || this.keybindings.matches(data, "tui.altScreen.top")) this.scrollView.scrollToStart();
     else return;
     this.tui.requestRender();
   }
 
-  render(width: number): string[] {
-    const innerWidth = Math.max(20, width - 4);
-    const stats = this.getStatsLines();
-    const content = this.renderContent(innerWidth);
-    const windowSize = Math.max(8, 24 - stats.length);
-    const maxOffset = Math.max(0, content.length - windowSize);
-    this.linesFromBottom = Math.min(this.linesFromBottom, maxOffset);
-    const end = content.length - this.linesFromBottom;
-    const start = Math.max(0, end - windowSize);
-    const visible = content.slice(start, end);
-    const border = (text: string) => this.theme.fg("border", text);
-    const row = (text: string) => {
-      const clipped = truncateToWidth(text, innerWidth);
-      return `${border("│")} ${clipped}${" ".repeat(Math.max(0, innerWidth - visibleWidth(clipped)))} ${border("│")}`;
-    };
-
-    return [
-      border(`╭${"─".repeat(innerWidth + 2)}╮`),
-      row(
-        this.theme.bold(this.theme.fg("accent", this.getTitle())) +
-          this.theme.fg("dim", formatLiveOutputModelDetails(this.getModelDetails())),
-      ),
-      ...stats.map((line) => row(this.theme.fg("dim", line))),
-      row(
-        this.theme.fg(
-          "dim",
-          `Live output • ↑↓/PgUp/PgDn scroll • End follow • Esc/${formatKeybindings(this.closeKeybindings)} close`,
-        ),
-      ),
-      border(`├${"─".repeat(innerWidth + 2)}┤`),
-      ...visible.map(row),
-      border(`╰${"─".repeat(innerWidth + 2)}╯`),
-    ];
-  }
-
-  contentChanged(): void {
-    this.tui.requestRender();
-  }
+  contentChanged(): void { if (!this.closed) this.tui.requestRender(); }
 
   close(): void {
     if (this.closed) return;
     this.closed = true;
     this.done();
   }
-
-  invalidate(): void {}
 }
 
 function formatLiveOutputModelDetails(modelDetails: StepModelDetails | undefined): string {

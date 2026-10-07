@@ -36,6 +36,26 @@
     "timeoutMs": 180000,
     "retryableErrorPatterns": []
   },
+  "sessions": {
+    "inheritSettings": true,
+    "inheritProviders": true
+  },
+  "capabilities": {
+    "codemode": {
+      "enabled": false,
+      "mode": "on",
+      "inlineBudget": 3000
+    },
+    "mcp": {
+      "enabled": false,
+      "servers": {},
+      "tools": {
+        "planner": [],
+        "coder": [],
+        "reviewer": []
+      }
+    }
+  },
   "commands": {
     "format": [],
     "lint": [],

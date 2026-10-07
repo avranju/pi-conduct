@@ -179,12 +179,16 @@ export function findLatestIterationFile(
 }
 
 export function getActiveRunPid(dir: RunDirectory): number | undefined {
-  const lockPath = path.join(dir.root, ".run.lock");
+  return getActiveLockPid(path.join(dir.root, ".run.lock"));
+}
+
+function getActiveLockPid(lockPath: string): number | undefined {
   if (!fs.existsSync(lockPath)) return undefined;
   try {
     const lock = readJson<{ pid?: number }>(lockPath);
-    if (!lock.pid) return undefined;
-    process.kill(lock.pid, 0);
+    if (!Number.isSafeInteger(lock.pid) || !lock.pid || lock.pid <= 0) return undefined;
+    try { process.kill(lock.pid, 0); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== "EPERM") return undefined; }
     return lock.pid;
   } catch {
     return undefined;
@@ -192,7 +196,15 @@ export function getActiveRunPid(dir: RunDirectory): number | undefined {
 }
 
 export function acquireRunLock(dir: RunDirectory): () => void {
-  const lockPath = path.join(dir.root, ".run.lock");
+  return acquireFileLock(path.join(dir.root, ".run.lock"), "Conduct run");
+}
+
+/** Lock the working tree's Git directory, outside tracked files and artifact fingerprints. */
+export function acquireRepositoryLock(gitDir: string): () => void {
+  return acquireFileLock(path.join(gitDir, "pi-conduct.lock"), "Conduct repository");
+}
+
+function acquireFileLock(lockPath: string, label: string): () => void {
   const token = randomUUID();
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
@@ -214,12 +226,18 @@ export function acquireRunLock(dir: RunDirectory): () => void {
         ? (error as NodeJS.ErrnoException).code
         : undefined;
       if (code !== "EEXIST") throw error;
-      const activePid = getActiveRunPid(dir);
-      if (activePid) throw new Error(`Conduct run is already active (pid ${activePid})`);
+      const activePid = getActiveLockPid(lockPath);
+      if (activePid) throw new Error(`${label} is already active (pid ${activePid})`);
+      // Another process can be between exclusive creation and writing its PID. Do not
+      // remove an incomplete, freshly created file; a crashed writer is recoverable shortly.
+      const lock = (() => { try { return readJson<{ pid?: number }>(lockPath); } catch { return undefined; } })();
+      if (!lock?.pid && Date.now() - fs.statSync(lockPath).mtimeMs < 10_000) {
+        throw new Error(`${label} lock is being initialized; try again shortly`);
+      }
       fs.rmSync(lockPath, { force: true });
     }
   }
-  throw new Error("Could not acquire Conduct run lock");
+  throw new Error(`Could not acquire ${label} lock`);
 }
 
 export function saveCoderPrompt(iterationDir: string, prompt: string): void {

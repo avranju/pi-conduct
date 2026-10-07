@@ -48,6 +48,7 @@ import {
 import { buildPlannerPrompt, buildCoderPrompt, buildReviewerPrompt } from "./prompts.js";
 import { countFindings, hasNonMinorFindings, truncate } from "./utils.js";
 import { initializeRunIdentity, type ResumeWorkflowData } from "./resume.js";
+import type { WorkflowAgentServices } from "./runtime.js";
 
 // ============================================================================
 // Supervisor - Main Workflow Orchestrator (§6, §13)
@@ -75,6 +76,7 @@ export async function runConductWorkflow(
   signal?: AbortSignal,
   progress = new ConductProgress(ctx, getLiveOutputKeybindings(config)),
   resume?: ResumeWorkflowData,
+  services?: WorkflowAgentServices,
 ): Promise<WorkflowResult> {
   const state: RunState = resume
     ? {
@@ -172,7 +174,7 @@ export async function runConductWorkflow(
     const plannerPrompt = buildPlannerPrompt(userPrompt, repoContext);
     if (runDir) savePlannerPrompt(runDir, plannerPrompt);
     const plannerResult: PlannerResult = await runPlanner(
-      plannerPrompt, config, ctx, signal, progress,
+      plannerPrompt, config, ctx, signal, progress, services,
     );
     if (runDir) {
       savePlanRaw(runDir, plannerResult.rawResponse);
@@ -271,7 +273,7 @@ export async function runConductWorkflow(
         : undefined;
       if (coderIterationDir) saveCoderPrompt(coderIterationDir, coderPrompt);
       updateState(coderStage, "coder", { iteration, inFlightRole: "coder" });
-      coderResult = await runCoder(coderPrompt, config, ctx, signal, progress);
+      coderResult = await runCoder(coderPrompt, config, ctx, signal, progress, services, `iteration ${iteration} coder`);
       lastCoderCompliance = coderResult.compliance;
       if (coderIterationDir && runDir) {
         saveCoderArtifacts(coderIterationDir, coderResult.rawResponse, coderResult.compliance ?? {
@@ -421,6 +423,8 @@ export async function runConductWorkflow(
       ctx,
       signal,
       progress,
+      services,
+      `iteration ${iteration} reviewer`,
     );
 
     if (reviewerIterationDir && runDir) {

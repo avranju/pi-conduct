@@ -13,6 +13,7 @@ import {
   createLocalBashOperations,
   defineTool,
   type BashOperations,
+  type BashToolOptions,
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 
@@ -23,8 +24,8 @@ import { isBlockedCommand, isNetworkCommand } from "./utils.js";
  * Build BashOperations that enforce the conduct safety policy before delegating
  * to Pi's standard local shell execution backend.
  */
-function guardedOperations(safety: SafetyConfig): BashOperations {
-  const base = createLocalBashOperations();
+function guardedOperations(safety: SafetyConfig, shellPath?: string): BashOperations {
+  const base = createLocalBashOperations({ shellPath });
   return {
     exec: async (command, cwd, options) => {
       if (isBlockedCommand(command, safety.blockedCommandPatterns)) {
@@ -49,6 +50,7 @@ function guardedOperations(safety: SafetyConfig): BashOperations {
 export function createSafeBashTool(
   cwd: string,
   safety: SafetyConfig,
+  options: Pick<BashToolOptions, "shellPath" | "commandPrefix"> = {},
 ): ToolDefinition {
-  return defineTool(createBashToolDefinition(cwd, { operations: guardedOperations(safety) }));
+  return defineTool(createBashToolDefinition(cwd, { ...options, operations: guardedOperations(safety, options.shellPath) }));
 }
